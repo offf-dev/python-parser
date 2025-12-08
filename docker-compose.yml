@@ -1,0 +1,22 @@
+version: '3.9'
+
+services:
+  fe-articles:
+    build: ./services/fe-articles
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./services/fe-articles/data:/app/data
+    env_file:
+      - ./services/fe-articles/.env
+    restart: unless-stopped
+
+  number-challenge:
+    build: ./services/number-challenge
+    ports:
+      - "5001:5000"
+    volumes:
+      - ./services/number-challenge/data:/app/data
+    env_file:
+      - ./services/number-challenge/.env
+    restart: unless-stopped
