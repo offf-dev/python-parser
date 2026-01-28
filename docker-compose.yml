@@ -7,6 +7,7 @@ services:
       - "5000:5000"
     volumes:
       - ./services/fe-articles/data:/app/data
+      - ./services/fe-articles/logs:/app/logs
     env_file:
       - ./services/fe-articles/.env
     restart: unless-stopped
