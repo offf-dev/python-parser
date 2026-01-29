@@ -1,4 +1,4 @@
-# app.py — версия с Async Playwright (фикс 'coroutine' not iterable)
+# app.py — версия с /debug формой для получения HTML (для анализа селекторов)
 
 import os
 import re
@@ -187,7 +187,6 @@ async def parse_resource(resource, limit=20):
             context = await browser.new_context(extra_http_headers=headers)
             page = await context.new_page()
 
-            # Retry логика: Попробовать 2 раза если timeout
             for attempt in range(2):
                 try:
                     await page.goto(resource['url'], wait_until='domcontentloaded', timeout=120000)  # Изменено на 'domcontentloaded' и 120 сек
@@ -240,6 +239,48 @@ async def parse_resource(resource, limit=20):
         logger.error(f"ОШИБКА парсинга {resource.get('name', 'unknown')}: {e}")
         return []
 
+# Новая async функция для получения только HTML (для /debug)
+async def get_page_html(url):
+    try:
+        ua = UserAgent()
+        headers = {
+            'User-Agent': ua.random,
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Referer': 'https://www.google.com/',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1'
+        }
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
+            context = await browser.new_context(extra_http_headers=headers)
+            page = await context.new_page()
+
+            for attempt in range(2):
+                try:
+                    await page.goto(url, wait_until='domcontentloaded', timeout=120000)
+                    break
+                except Exception as goto_e:
+                    if 'Timeout' in str(goto_e):
+                        logger.warning(f"Timeout на goto (попытка {attempt+1}/2) для {url}")
+                        if attempt == 1:
+                            raise
+                    else:
+                        raise
+
+            html = await page.content()
+            await browser.close()
+
+        return html
+    except Exception as e:
+        logger.error(f"ОШИБКА получения HTML для {url}: {e}")
+        return f"Ошибка: {str(e)}"
+
 # ====================== АВТОПАРСИНГ ======================
 async def send_new_articles_async():
     try:
@@ -261,7 +302,7 @@ async def send_new_articles_async():
                 logger.info(f"Ресурс {resource['name']} на паузе — пропускаем")
                 continue
             name = resource['name']
-            current_items = await parse_resource(resource, limit=20)  # ← await!
+            current_items = await parse_resource(resource, limit=20)
 
             known_articles = updated_last_results.get(name, [])
             known_urls = {art['url'] for art in known_articles}
@@ -512,6 +553,63 @@ HTML = '''
 </html>
 '''
 
+# Новый маршрут /debug
+DEBUG_HTML = '''
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Debug: Получить HTML страницы</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 1200px; margin: 0 auto; padding: 20px; background: #f5f5f5; }
+        h2 { color: #333; }
+        input, button { width: 100%; padding: 12px; margin: 10px 0; font-size: 16px; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; }
+        button { background: #28a745; color: white; cursor: pointer; }
+        button:hover { background: #218838; }
+        .error { color: red; background: #ffe6e6; padding: 15px; border-radius: 5px; margin: 10px 0; }
+        .success { color: green; background: #e6ffe6; padding: 15px; border-radius: 5px; margin: 10px 0; }
+        pre { background: #f8f9fa; padding: 15px; border-radius: 5px; overflow: auto; max-height: 600px; }
+    </style>
+</head>
+<body>
+    <h2>Debug: Введите URL для получения HTML</h2>
+    <form method="post">
+        <input type="text" name="url" placeholder="URL страницы" value="{{ url if url else '' }}" required>
+        <button type="submit">Получить HTML</button>
+    </form>
+
+    {% if error %}<div class="error">{{ error }}</div>{% endif %}
+
+    {% if html %}
+        <h3>HTML код страницы ({{ html_length }} символов)</h3>
+        <pre>{{ html }}</pre>
+    {% endif %}
+</body>
+</html>
+'''
+
+@app.route('/debug', methods=['GET', 'POST'])
+def debug():
+    logger.info("Запрос к /debug")
+    url = ''
+    error = None
+    html = None
+    html_length = 0
+
+    if request.method == 'POST':
+        url = request.form['url'].strip()
+        try:
+            html = asyncio.run(get_page_html(url))
+            if 'Ошибка' in html:
+                error = html
+                html = None
+            else:
+                html_length = len(html)
+        except Exception as e:
+            error = f"Ошибка получения HTML: {str(e)}"
+
+    return render_template_string(DEBUG_HTML, url=url, error=error, html=html, html_length=html_length)
+
 @app.route('/', methods=['GET', 'POST'])
 def index():
     logger.info("Запрос к веб-интерфейсу")
@@ -570,7 +668,7 @@ def index():
             resource = current_form
 
             try:
-                data = asyncio.run(parse_resource(current_form, limit=20))  # ← asyncio.run для sync
+                data = asyncio.run(parse_resource(current_form, limit=20))
                 if not data:
                     error = "Ничего не найдено по указанным селекторам"
                 else:
