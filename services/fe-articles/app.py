@@ -256,11 +256,15 @@ async def parse_resource(resource, limit=20):
                     "url": link
                 })
 
+        if not data:
+            return [], "селекторы не найдены или нет статей на странице"
+
         logger.info(f"Успешно спаршено {len(data)} статей (лимит: {limit}) с {resource['name']}")
-        return data
+        return data, None
     except Exception as e:
-        logger.error(f"ОШИБКА парсинга {resource.get('name', 'unknown')}: {e}")
-        return []
+        error_msg = f"сайт недоступен: {str(e)}"
+        logger.error(f"ОШИБКА парсинга {resource.get('name', 'unknown')}: {error_msg}")
+        return [], error_msg
 
 # Новая async функция для получения только HTML (для /debug)
 async def get_page_html(url):
@@ -319,16 +323,21 @@ async def send_new_articles_async():
         all_articles = []
         all_new_articles = []
         updated_last_results = last_results.copy()
+        lines = []
 
         for resource in resources:
             if resource.get('paused', False):
                 logger.info(f"Ресурс {resource['name']} на паузе — пропускаем")
                 continue
             name = resource['name']
-            current_items = await parse_resource(resource, limit=20)
+            current_items, error_msg = await parse_resource(resource, limit=20)
 
-            known_articles = updated_last_results.get(name, [])
-            known_urls = {art['url'] for art in known_articles}
+            lines.append(f"\n<b>📍 {name}</b>\n")
+
+            if error_msg:
+                lines.append(f"🚨 {error_msg}")
+                logger.info(f"Ошибка для {name}: {error_msg}")
+                continue
 
             resource_articles = []
             new_items = []
@@ -344,6 +353,9 @@ async def send_new_articles_async():
                 resource_articles.append({"title": clean_title, "url": url})
                 all_articles.append({"Источник": name, "title": clean_title, "url": url})
 
+                known_articles = updated_last_results.get(name, [])
+                known_urls = {art['url'] for art in known_articles}
+
                 if url not in known_urls:
                     new_items.append({"title": clean_title, "url": url})
                     all_new_articles.append({"Источник": name, "title": clean_title, "url": url})
@@ -355,17 +367,12 @@ async def send_new_articles_async():
 
             logger.info(f"Спаршено {len(resource_articles)} статей с {name} (из них новых: {len(new_items)})")
 
-        save_last_results(updated_last_results)
-
-        if all_articles:
-            lines = []
-            current_source = None
-            for art in all_articles:
-                if art["Источник"] != current_source:
-                    current_source = art["Источник"]
-                    lines.append(f"\n<b>📍 {current_source}</b>\n")
+            for art in resource_articles:
                 lines.append(f"• <a href='{art['url']}'>{art['title']}</a>")
 
+        save_last_results(updated_last_results)
+
+        if lines:
             message = f"<b>🔥 Свежие статьи ({len(all_articles)} шт.)</b>\n"
             message += "\n".join(lines)
 
@@ -691,8 +698,10 @@ def index():
             resource = current_form
 
             try:
-                data = asyncio.run(parse_resource(current_form, limit=20))
-                if not data:
+                data, parse_error = asyncio.run(parse_resource(current_form, limit=20))
+                if parse_error:
+                    error = f"Ошибка парсинга: {parse_error}"
+                elif not data:
                     error = "Ничего не найдено по указанным селекторам"
                 else:
                     df = pd.DataFrame([{"Заголовок": art['title'], "Ссылка": f"<a href='{art['url']}'>{art['url']}</a>"} for art in data])
