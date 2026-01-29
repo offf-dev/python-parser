@@ -6,3 +6,5 @@ pandas==2.2.3
 apscheduler==3.10.4
 python-telegram-bot==21.6
 hypercorn
+fake-useragent  # Для randomization UA
+playwright  # Для браузерного scraping

@@ -1,4 +1,4 @@
-# app.py — версия с проверкой на новые статьи и логированием
+# app.py — версия с Async Playwright (фикс 'coroutine' not iterable)
 
 import os
 import re
@@ -11,12 +11,11 @@ import traceback  # Для стека ошибок
 
 from flask import Flask, request, render_template_string
 from bs4 import BeautifulSoup, MarkupResemblesLocatorWarning
-import requests
 from urllib.parse import urljoin
 import pandas as pd
 
 from urllib3.exceptions import InsecureRequestWarning
-requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+import warnings
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.events import EVENT_JOB_ERROR  # Для listener ошибок
@@ -26,7 +25,12 @@ from telegram.ext import ApplicationBuilder
 
 import logging
 from logging.handlers import TimedRotatingFileHandler
-import warnings
+
+# Async Playwright импорт
+from playwright.async_api import async_playwright
+
+# Fake UA (если не установлен, удалите или pip install)
+from fake_useragent import UserAgent
 
 # ====================== LOGGING ======================
 def setup_logging():
@@ -71,7 +75,7 @@ PARSER_INTERVAL_MINUTES = int(os.getenv("PARSER_INTERVAL_MINUTES", 10))
 DATA_FILE = 'data/resources.json'
 LAST_RESULTS_FILE = 'data/last_results.json'
 
-# Lock для файлов (чтобы избежать race conditions в async/Flask)
+# Lock для файлов
 file_lock = threading.Lock()
 
 # ====================== ИНИЦИАЛИЗАЦИЯ БОТА ======================
@@ -88,9 +92,9 @@ async def init_bot():
         await bot_app.start()
     except Exception as e:
         logger.error(f"Ошибка инициализации бота: {e}")
-        raise  # Поднимем, чтобы main() поймал
+        raise
 
-# ====================== ОТПРАВКА В ТГ (с обработкой ошибок) ======================
+# ====================== ОТПРАВКА В ТГ ======================
 async def send_telegram_message(text: str):
     try:
         await bot.send_message(
@@ -103,7 +107,6 @@ async def send_telegram_message(text: str):
     except Exception as e:
         logger.error(f"НЕ УДАЛОСЬ отправить сообщение в Telegram: {e}")
 
-# Функция для отправки ошибки в Telegram (async)
 async def send_error_to_telegram(error_msg: str):
     await send_telegram_message(f"<b>🚨 Ошибка в парсере!</b>\n\n{error_msg}\n\nПроверьте логи для деталей.")
 
@@ -159,11 +162,14 @@ resources = load_resources()
 last_results = load_last_results()
 
 # ====================== ПАРСИНГ ======================
-def parse_resource(resource, limit=20):
+async def parse_resource(resource, limit=20):
     try:
         logger.info(f"Парсим: {resource['name']} → {resource['url']}")
+
+        # Рандомизация User-Agent
+        ua = UserAgent()
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',  # Обновите на свежий
+            'User-Agent': ua.random,
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.5',
             'Referer': 'https://www.google.com/',
@@ -174,9 +180,31 @@ def parse_resource(resource, limit=20):
             'Sec-Fetch-Site': 'none',
             'Sec-Fetch-User': '?1'
         }
-        response = requests.get(resource['url'], headers=headers, timeout=20, verify=False)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, 'lxml')
+
+        # Async Playwright с retry для goto
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
+            context = await browser.new_context(extra_http_headers=headers)
+            page = await context.new_page()
+
+            # Retry логика: Попробовать 2 раза если timeout
+            for attempt in range(2):
+                try:
+                    await page.goto(resource['url'], wait_until='domcontentloaded', timeout=120000)  # Изменено на 'domcontentloaded' и 120 сек
+                    break
+                except Exception as goto_e:
+                    if 'Timeout' in str(goto_e):
+                        logger.warning(f"Timeout на goto (попытка {attempt+1}/2) для {resource['url']}")
+                        if attempt == 1:
+                            raise
+                    else:
+                        raise
+
+            html = await page.content()
+            logger.info(f"Длина полученного HTML: {len(html)}")
+            await browser.close()
+
+        soup = BeautifulSoup(html, 'lxml')
         items = soup.select(resource['item_selector'])
         logger.info(f"Найдено {len(items)} элементов, берём первые {limit}")
 
@@ -189,10 +217,9 @@ def parse_resource(resource, limit=20):
             link = link_tag['href'] if link_tag and link_tag.has_attr('href') else None
             if link:
                 link = urljoin(resource['url'], link)
-                if not link.startswith('http'):  # Пропускаем невалидные (mailto:, js:)
+                if not link.startswith('http'):
                     continue
 
-                # Очистка заголовка (только здесь, без повторов)
                 with warnings.catch_warnings(record=True) as w:
                     clean_title = BeautifulSoup(title, "lxml").get_text(strip=True)
                     for warning in w:
@@ -234,7 +261,7 @@ async def send_new_articles_async():
                 logger.info(f"Ресурс {resource['name']} на паузе — пропускаем")
                 continue
             name = resource['name']
-            current_items = parse_resource(resource, limit=50)
+            current_items = await parse_resource(resource, limit=20)  # ← await!
 
             known_articles = updated_last_results.get(name, [])
             known_urls = {art['url'] for art in known_articles}
@@ -315,7 +342,6 @@ def job_error_listener(event):
     if event.exception:
         error_msg = f"Ошибка в job {event.job_id}: {str(event.exception)}\n{event.traceback}"
         logger.error(error_msg)
-        # Поскольку listener sync, используем coroutine_threadsafe для async отправки
         loop = asyncio.get_event_loop()
         asyncio.run_coroutine_threadsafe(send_error_to_telegram(error_msg), loop)
 
@@ -346,7 +372,7 @@ from hypercorn.asyncio import serve
 
 async def run_scheduler_and_bot():
     try:
-        await init_bot()  # Инициализация с try
+        await init_bot()
 
         logger.info("Запуск планировщика APScheduler...")
         scheduler.start()
@@ -361,7 +387,6 @@ async def run_scheduler_and_bot():
         logger.error(error_msg)
         await send_error_to_telegram(error_msg)
 
-# Обработка выхода/краша (atexit — sync, так что threadsafe)
 def on_exit():
     error_msg = "Парсер завершается (возможно, краш или рестарт)"
     logger.info(error_msg)
@@ -388,7 +413,7 @@ async def main():
         logger.error(error_msg)
         await send_error_to_telegram(error_msg)
 
-# ==================== HTML + РОУТ (без изменений, кроме limit в parse) ====================
+# ==================== HTML + РОУТ ====================
 HTML = '''
 <!DOCTYPE html>
 <html lang="ru">
@@ -542,10 +567,10 @@ def index():
                 success = f"Добавлен: {current_form['name']}"
 
         elif action == "parse":
-            resource = current_form  # Возвращаем в форму
+            resource = current_form
 
             try:
-                data = parse_resource(current_form, limit=50)  # Унифицировали limit
+                data = asyncio.run(parse_resource(current_form, limit=20))  # ← asyncio.run для sync
                 if not data:
                     error = "Ничего не найдено по указанным селекторам"
                 else:
