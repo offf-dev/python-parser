@@ -169,27 +169,50 @@ async def parse_resource(resource, limit=20):
         # Рандомизация User-Agent
         ua = UserAgent()
         headers = {
-            'User-Agent': ua.random,
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.5',
-            'Referer': 'https://www.google.com/',
+            'Accept-Encoding': 'gzip, deflate, br',
             'Connection': 'keep-alive',
             'Upgrade-Insecure-Requests': '1',
             'Sec-Fetch-Dest': 'document',
             'Sec-Fetch-Mode': 'navigate',
             'Sec-Fetch-Site': 'none',
-            'Sec-Fetch-User': '?1'
+            'Sec-Fetch-User': '?1',
+            'Referer': 'https://www.google.com/',
+            'Sec-CH-UA': '"Not A;Brand";v="99", "Chromium";v="121", "Google Chrome";v="121"',
+            'Sec-CH-UA-Mobile': '?0',
+            'Sec-CH-UA-Platform': '"Windows"'
         }
 
         # Async Playwright с retry для goto
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
-            context = await browser.new_context(extra_http_headers=headers)
+            browser = await p.chromium.launch(
+                headless=True,
+                args=[
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-blink-features=AutomationControlled',
+                    '--disable-infobars',
+                    '--window-size=1920,1080'
+                ]
+            )
+            context = await browser.new_context(
+                extra_http_headers=headers,
+                user_agent=headers['User-Agent'],
+                viewport={'width': 1920, 'height': 1080}
+            )
             page = await context.new_page()
 
             for attempt in range(2):
                 try:
-                    await page.goto(resource['url'], wait_until='domcontentloaded', timeout=120000)  # Изменено на 'domcontentloaded' и 120 сек
+                    await page.add_init_script("""Object.defineProperty(navigator, 'webdriver', { get: () => undefined });""")
+                    await page.add_init_script("""Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });""")
+                    await page.add_init_script("""Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });""")
+
+                    logger.info(f"Заголовки: {headers}")
+                    await page.goto(resource['url'], wait_until='domcontentloaded', timeout=120000)
+                    await page.wait_for_timeout(2000)
                     break
                 except Exception as goto_e:
                     if 'Timeout' in str(goto_e):
