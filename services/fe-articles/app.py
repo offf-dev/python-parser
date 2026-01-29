@@ -166,8 +166,7 @@ async def parse_resource(resource, limit=20):
     try:
         logger.info(f"Парсим: {resource['name']} → {resource['url']}")
 
-        # Рандомизация User-Agent
-        ua = UserAgent()
+        # Фиксированные headers (как в п1)
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
@@ -184,42 +183,43 @@ async def parse_resource(resource, limit=20):
             'Sec-CH-UA-Mobile': '?0',
             'Sec-CH-UA-Platform': '"Windows"'
         }
+        logger.info(f"Используемые заголовки: {headers}")  # Для отладки
 
-        # Async Playwright с retry для goto
         async with async_playwright() as p:
+            # Запуск с маскировкой (п2)
             browser = await p.chromium.launch(
                 headless=True,
                 args=[
                     '--no-sandbox',
                     '--disable-setuid-sandbox',
-                    '--disable-blink-features=AutomationControlled',
-                    '--disable-infobars',
-                    '--window-size=1920,1080'
+                    '--disable-blink-features=AutomationControlled',  # Скрываем автоматизацию
+                    '--disable-infobars',  # Убираем панель "Chrome управляется"
+                    '--window-size=1920,1080'  # Реалистичный размер окна
                 ]
             )
             context = await browser.new_context(
                 extra_http_headers=headers,
                 user_agent=headers['User-Agent'],
-                viewport={'width': 1920, 'height': 1080}
+                viewport={'width': 1920, 'height': 1080}  # Десктопный вид
             )
             page = await context.new_page()
 
-            for attempt in range(2):
-                try:
-                    await page.add_init_script("""Object.defineProperty(navigator, 'webdriver', { get: () => undefined });""")
-                    await page.add_init_script("""Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });""")
-                    await page.add_init_script("""Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });""")
+            # Добавляем скрипты маскировки (п2)
+            await page.add_init_script("""Object.defineProperty(navigator, 'webdriver', { get: () => undefined });""")
+            await page.add_init_script("""Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });""")  # Фейковые плагины
+            await page.add_init_script("""Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });""")  # Фейковые языки
+            await page.add_init_script("""Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });""")  # Фейковая платформа
+            await page.add_init_script("""Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });""")  # Фейковое железо
 
-                    logger.info(f"Заголовки: {headers}")
-                    await page.goto(resource['url'], wait_until='domcontentloaded', timeout=120000)
-                    await page.wait_for_timeout(2000)
+            # Goto с повтором и задержкой
+            for attempt in range(3):  # Увеличили до 3 попыток
+                try:
+                    await page.goto(resource['url'], wait_until='domcontentloaded', timeout=180000)  # Таймаут 3 мин
+                    await page.wait_for_timeout(3000)  # 3 сек задержки для имитации человека
                     break
                 except Exception as goto_e:
-                    if 'Timeout' in str(goto_e):
-                        logger.warning(f"Timeout на goto (попытка {attempt+1}/2) для {resource['url']}")
-                        if attempt == 1:
-                            raise
-                    else:
+                    logger.warning(f"Ошибка goto (попытка {attempt+1}/3) для {resource['url']}: {str(goto_e)}")
+                    if attempt == 2:
                         raise
 
             html = await page.content()
