@@ -15,10 +15,8 @@
 # 1. Основная команда — после любых изменений
 docker compose up -d --build
 
-# 2. Просто перезапустить (без пересборки)
+# 2. Просто перезапустить без пересборки (например изменился код или env)
 docker compose up -d
-# или короче:
-docker compose restart
 
 # 3. Остановить всё
 docker compose down
@@ -166,3 +164,12 @@ ufw allow 5001/tcp
 http://83.229.87.135:5001/
 ```
 
+# Закинуть изменения по проекту
+
+```bash
+ssh root@YOUR_SERVER_IP
+cd /opt/python-parser
+git status
+git pull origin main
+docker compose up -d --build SERVISE_NAME
+```
