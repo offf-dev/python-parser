@@ -24,6 +24,7 @@ from telegram import Bot
 from telegram.constants import ParseMode
 from telegram.ext import ApplicationBuilder
 
+import time
 import logging
 from logging.handlers import TimedRotatingFileHandler
 
@@ -58,6 +59,12 @@ def setup_logging():
     handler.setFormatter(formatter)
     logger.addHandler(handler)
 
+    # Настройка для APScheduler: перенаправляем его логи в наш файл
+    aps_logger = logging.getLogger('apscheduler')
+    aps_logger.setLevel(logging.INFO)  # Или logging.WARNING, если хотите меньше вывода
+    aps_logger.addHandler(handler)
+    aps_logger.propagate = False  # Чтобы не дублировалось в root logger
+
     logging.captureWarnings(True)
     warnings.filterwarnings("always", category=MarkupResemblesLocatorWarning)
     warnings.filterwarnings(
@@ -75,8 +82,12 @@ logger = setup_logging()
 app = Flask(__name__)
 
 # ====================== НАСТРОЙКИ ======================
-TELEGRAM_TOKEN = os.getenv("TG_BOT_TOKEN_FOR_ARTICLES")
-TELEGRAM_CHANNEL_ID = int(os.getenv("TG_CHAT_ID_FOR_ARTICLES"))
+TELEGRAM_TOKEN_ARTICLES = os.getenv("TG_BOT_TOKEN_FOR_ARTICLES")
+TELEGRAM_CHANNEL_ID_ARTICLES = int(os.getenv("TG_CHAT_ID_FOR_ARTICLES"))
+
+TELEGRAM_TOKEN_LOGS = os.getenv("TG_BOT_TOKEN_FOR_LOGS")
+TELEGRAM_CHANNEL_ID_LOGS = int(os.getenv("TG_CHAT_ID_FOR_LOGS"))
+
 PARSER_INTERVAL_MINUTES = int(os.getenv("PARSER_INTERVAL_MINUTES", 10))
 
 DATA_FILE = 'data/resources.json'
@@ -129,38 +140,63 @@ def get_db_engine():
 engine = get_db_engine()
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine) if engine else None
 
-# ====================== ИНИЦИАЛИЗАЦИЯ БОТА ======================
-bot_app = None
-bot = None
+# ====================== ИНИЦИАЛИЗАЦИЯ БОТОВ ======================
+articles_app = None
+articles_bot = None
+logs_app = None
+logs_bot = None
 
-async def init_bot():
-    global bot_app, bot
+async def init_articles_bot():
+    global articles_app, articles_bot
     try:
-        logger.info("Инициализация Telegram бота...")
-        bot_app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-        bot = bot_app.bot
-        await bot_app.initialize()
-        await bot_app.start()
+        logger.info("Инициализация Telegram бота для статей...")
+        articles_app = ApplicationBuilder().token(TELEGRAM_TOKEN_ARTICLES).build()
+        articles_bot = articles_app.bot
+        await articles_app.initialize()
+        await articles_app.start()
     except Exception as e:
-        logger.error(f"Ошибка инициализации бота: {e}")
+        logger.error(f"Ошибка инициализации бота для статей: {e}")
+        raise
+
+async def init_logs_bot():
+    global logs_app, logs_bot
+    try:
+        logger.info("Инициализация Telegram бота для логов...")
+        logs_app = ApplicationBuilder().token(TELEGRAM_TOKEN_LOGS).build()
+        logs_bot = logs_app.bot
+        await logs_app.initialize()
+        await logs_app.start()
+    except Exception as e:
+        logger.error(f"Ошибка инициализации бота для логов: {e}")
         raise
 
 # ====================== ОТПРАВКА В ТГ ======================
 async def send_telegram_message(text: str):
     try:
-        await bot.send_message(
-            chat_id=TELEGRAM_CHANNEL_ID,
+        await articles_bot.send_message(
+            chat_id=TELEGRAM_CHANNEL_ID_ARTICLES,
             text=text,
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True
         )
-        logger.info("Сообщение успешно отправлено в Telegram канал")
+        logger.info("Сообщение успешно отправлено в Telegram канал для статей")
     except Exception as e:
-        error_msg = f"НЕ УДАЛОСЬ отправить сообщение в Telegram: {e}"
+        error_msg = f"НЕ УДАЛОСЬ отправить сообщение в Telegram (статьи): {e}"
+        await send_error_to_telegram(error_msg)
         logger.error(error_msg)
 
 async def send_error_to_telegram(error_msg: str):
-    await send_telegram_message(f"<b>🚨 Ошибка в парсере!</b>\n\n{error_msg}\n\nПроверьте логи для деталей.")
+    try:
+        await logs_bot.send_message(
+            chat_id=TELEGRAM_CHANNEL_ID_LOGS,
+            text=f"<b>🚨 Ошибка в парсере!</b>\n\n{error_msg}\n\nПроверьте логи для деталей.",
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True
+        )
+        logger.info("Сообщение об ошибке успешно отправлено в Telegram канал для логов")
+    except Exception as e:
+        error_msg = f"НЕ УДАЛОСЬ отправить сообщение об ошибке в Telegram (логи): {e}"
+        logger.error(error_msg)
 
 # ====================== ФАЙЛЫ ======================
 def load_resources():
@@ -419,14 +455,15 @@ async def parse_resource(resource, limit=20):
             await page.add_init_script("""Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });""")  # Фейковое железо
 
             # Goto с повтором и задержкой
-            for attempt in range(3):  # Увеличили до 3 попыток
+            for attempt in range(5):  # Было 3
                 try:
-                    await page.goto(resource['url'], wait_until='domcontentloaded', timeout=180000)  # Таймаут 3 мин
-                    await page.wait_for_timeout(3000)  # 3 сек задержки для имитации человека
+                    await asyncio.sleep(random.uniform(1, 3))  # Добавить import random
+                    await page.goto(resource['url'], wait_until='domcontentloaded', timeout=180000)
+                    await page.wait_for_timeout(3000)
                     break
                 except Exception as goto_e:
-                    logger.warning(f"Ошибка goto (попытка {attempt+1}/3) для {resource['url']}: {str(goto_e)}")
-                    if attempt == 2:
+                    logger.warning(f"Ошибка goto (попытка {attempt+1}/5) для {resource['url']}: {str(goto_e)}")
+                    if attempt == 4:
                         raise
 
             html = await page.content()
@@ -471,7 +508,7 @@ async def parse_resource(resource, limit=20):
     except Exception as e:
         error_msg = f"сайт недоступен: {str(e)}"
         logger.error(f"ОШИБКА парсинга {resource.get('name', 'unknown')}: {error_msg}")
-        await send_error_to_telegram(f"Ошибка парсинга сайта {resource.get('name', 'unknown')}: {error_msg}")
+        await send_error_to_telegram(error_msg)
         return [], error_msg
 
 # Новая async функция для получения только HTML (для /debug)
@@ -519,6 +556,8 @@ async def get_page_html(url):
 # ====================== АВТОПАРСИНГ ======================
 async def send_new_articles_async():
     try:
+        start_time = time.perf_counter()  # Начало измерения общего времени
+
         global resources, last_results
         logger.info("Запуск автопарсинга — проверяем на новые статьи")
 
@@ -527,7 +566,6 @@ async def send_new_articles_async():
             await send_telegram_message("База ресурсов пуста")
             return
 
-        all_articles = []
         all_new_articles = []
         lines = []
 
@@ -537,6 +575,8 @@ async def send_new_articles_async():
                 continue
 
             name = resource['name']
+            res_start_time = time.perf_counter()  # Начало измерения для ресурса
+
             try:
                 current_items, error_msg = await parse_resource(resource, limit=20)
             except Exception as parse_e:
@@ -545,12 +585,15 @@ async def send_new_articles_async():
                 await send_error_to_telegram(error_msg)  # Добавляем отправку в TG
                 current_items = []
 
-            lines.append(f"\n<b>📍 {name}</b>\n")
+            res_elapsed = time.perf_counter() - res_start_time
+            logger.info(f"Парсинг ресурса {name} занял {res_elapsed:.2f} секунд")
 
             if error_msg:
-                lines.append(f"🚨 {error_msg}")
                 logger.info(f"Ошибка для {name}: {error_msg}")
-                continue
+                continue  # Пропускаем добавление в lines
+
+            if len(current_items) > 0:
+                lines.append(f"📍 {name} ({len(current_items)} статей)")
 
             resource_articles = []
             new_items = []
@@ -567,7 +610,6 @@ async def send_new_articles_async():
                 logger.info(f"  → {url}\n")
 
                 resource_articles.append({"title": clean_title, "url": url})
-                all_articles.append({"Источник": name, "title": clean_title, "url": url})
 
                 if url not in known_urls:
                     new_items.append({"title": clean_title, "url": url})
@@ -576,14 +618,13 @@ async def send_new_articles_async():
             if new_items:
                 save_new_articles(name, new_items)   # ← сохранение
 
-            logger.info(f"Спаршено {len(resource_articles)} статей с {name} (из них новых: {len(new_items)})")
+            resource_articles_count = len(resource_articles)
+            new_items_count = len(new_items)
 
-            for art in resource_articles:
-                lines.append(f"• <a href='{art['url']}'>{art['title']}</a>")
+            logger.info(f"Спаршено {resource_articles_count} статей с {name} (из них новых: {new_items_count})")
 
         if lines:
-            message = f"<b>🔥 Свежие статьи ({len(all_articles)} шт.)</b>\n"
-            message += "\n".join(lines)
+            message = f"🔥 Обновление парсинга\n\n" + "\n".join(lines)
 
             if all_new_articles:
                 new_lines = []
@@ -594,13 +635,17 @@ async def send_new_articles_async():
                         new_lines.append(f"\n<b>📍 {current_source}</b>\n")
                     new_lines.append(f"• <a href='{art['url']}'>{art['title']}</a>")
 
-                message += f"\n\n<b>Среди них новые ({len(all_new_articles)} шт.):</b>\n"
+                message += f"\n\n<b>Новые статьи ({len(all_new_articles)} шт.):</b>\n"
                 message += "\n".join(new_lines)
         else:
             message = "Ничего не спарсили 😔"
 
         await send_telegram_message(message)
         logger.info("Цикл автопарсинга отработал")
+
+        total_elapsed = time.perf_counter() - start_time
+        logger.info(f"Общий парсинг занял {total_elapsed:.2f} секунд")
+
     except Exception as e:
         error_msg = f"Ошибка в автопарсинге: {str(e)}\n{traceback.format_exc()}"
         logger.error(error_msg)
@@ -652,7 +697,8 @@ from hypercorn.asyncio import serve
 
 async def run_scheduler_and_bot():
     try:
-        await init_bot()
+        await init_articles_bot()
+        await init_logs_bot()
 
         logger.info("Запуск планировщика APScheduler...")
         scheduler.start()
