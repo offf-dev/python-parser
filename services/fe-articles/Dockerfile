@@ -23,6 +23,8 @@ RUN apt-get update && apt-get install -y \
     libxshmfence1 \
     fonts-liberation \
     xdg-utils \
+    default-libmysqlclient-dev \
+    pkg-config \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

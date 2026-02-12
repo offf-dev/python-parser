@@ -9,7 +9,8 @@ from datetime import datetime, timedelta
 import atexit  # Для обработки выхода/краша
 import traceback  # Для стека ошибок
 
-from flask import Flask, request, render_template_string
+from flask import Flask, request, render_template_string, redirect, url_for, flash
+from math import ceil
 from bs4 import BeautifulSoup, MarkupResemblesLocatorWarning
 from urllib.parse import urljoin
 import pandas as pd
@@ -31,6 +32,12 @@ from playwright.async_api import async_playwright
 
 # Fake UA (если не установлен, удалите или pip install)
 from fake_useragent import UserAgent
+
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.exc import SQLAlchemyError
+
+from html import escape
 
 # ====================== LOGGING ======================
 def setup_logging():
@@ -68,15 +75,59 @@ logger = setup_logging()
 app = Flask(__name__)
 
 # ====================== НАСТРОЙКИ ======================
-TELEGRAM_TOKEN = os.getenv("TG_BOT_TOKEN")
-TELEGRAM_CHANNEL_ID = int(os.getenv("TG_CHAT_ID"))
+TELEGRAM_TOKEN = os.getenv("TG_BOT_TOKEN_FOR_ARTICLES")
+TELEGRAM_CHANNEL_ID = int(os.getenv("TG_CHAT_ID_FOR_ARTICLES"))
 PARSER_INTERVAL_MINUTES = int(os.getenv("PARSER_INTERVAL_MINUTES", 10))
 
 DATA_FILE = 'data/resources.json'
 LAST_RESULTS_FILE = 'data/last_results.json'
 
+# Пагинация
+PER_PAGE_OPTIONS = [20, 50, 100]
+DEFAULT_PER_PAGE = 20
+
+# ГИБРИДНЫЙ РЕЖИМ
+USE_DB_FOR_RESOURCES = os.getenv("USE_DB_FOR_RESOURCES", "false").lower() == "true"
+USE_DB_FOR_ARTICLES = os.getenv("USE_DB_FOR_ARTICLES", "false").lower() == "true"
+
+# БД
+DB_HOST = os.getenv("DB_HOST", "127.0.0.1")
+DB_PORT = os.getenv("DB_PORT", "3306")
+DB_DATABASE = os.getenv("DB_DATABASE")
+DB_USERNAME = os.getenv("DB_USERNAME")
+DB_PASSWORD = os.getenv("DB_PASSWORD")
+DB_USE_SSL = os.getenv("DB_USE_SSL", "false").lower() == "true"
+
 # Lock для файлов
 file_lock = threading.Lock()
+
+# ====================== Создание движка БД ======================
+def get_db_engine():
+    if not all([DB_USERNAME, DB_PASSWORD, DB_DATABASE, DB_HOST]):
+        logger.warning("Не все параметры БД указаны")
+        return None
+
+    # MySQL подключение
+    connection_string = f"mysql+pymysql://{DB_USERNAME}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_DATABASE}"
+
+    # Добавляем параметры для лучшей совместимости
+    if DB_USE_SSL:
+        connection_string += "?ssl_verify_cert=false&ssl_verify_server_cert=false"
+    else:
+        connection_string += "?ssl_verify_cert=false"
+
+    return create_engine(
+        connection_string,
+        pool_pre_ping=True,
+        pool_recycle=3600,
+        pool_size=10,
+        max_overflow=20,
+        echo=False,
+        connect_args={"charset": "utf8mb4"}
+    )
+
+engine = get_db_engine()
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine) if engine else None
 
 # ====================== ИНИЦИАЛИЗАЦИЯ БОТА ======================
 bot_app = None
@@ -105,36 +156,108 @@ async def send_telegram_message(text: str):
         )
         logger.info("Сообщение успешно отправлено в Telegram канал")
     except Exception as e:
-        logger.error(f"НЕ УДАЛОСЬ отправить сообщение в Telegram: {e}")
+        error_msg = f"НЕ УДАЛОСЬ отправить сообщение в Telegram: {e}"
+        logger.error(error_msg)
 
 async def send_error_to_telegram(error_msg: str):
     await send_telegram_message(f"<b>🚨 Ошибка в парсере!</b>\n\n{error_msg}\n\nПроверьте логи для деталей.")
 
 # ====================== ФАЙЛЫ ======================
 def load_resources():
+    if USE_DB_FOR_RESOURCES:
+        return load_resources_from_db()
+    else:
+        return load_resources_from_json()
+
+def load_resources_from_json():
+    # ваш текущий код load_resources()
     with file_lock:
         try:
             if os.path.exists(DATA_FILE):
                 with open(DATA_FILE, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                     for res in data:
-                        if 'paused' not in res:
-                            res['paused'] = False
-                    logger.info(f"Загружено {len(data)} ресурсов из {DATA_FILE}")
+                        if 'active' not in res:
+                            res['active'] = not res.get('paused', False)  # миграция
+                        if 'paused' in res:
+                            del res['paused']
+                    logger.info(f"Загружено {len(data)} ресурсов из JSON")
                     return data
         except Exception as e:
-            logger.error(f"Ошибка загрузки ресурсов: {e}")
+            logger.error(f"Ошибка загрузки JSON ресурсов: {e}")
     return []
 
+def load_resources_from_db():
+    if not SessionLocal:
+        logger.error("БД не настроена")
+        return []
+    try:
+        with SessionLocal() as session:
+            result = session.execute(text("""
+                SELECT id, site_key, articles_selector, title_selector,
+                       url_selector, active
+                FROM sites
+                WHERE active = 1
+            """)).fetchall()
+
+            resources = []
+            for row in result:
+                resources.append({
+                    "name": row.site_key,
+                    "url": f"https://{row.site_key}",                    # ← по умолчанию, как в Laravel
+                    "item_selector": row.articles_selector,
+                    "title_selector": row.title_selector,
+                    "link_selector": row.url_selector,
+                    "active": bool(row.active)
+                })
+            logger.info(f"Загружено {len(resources)} ресурсов из БД (sites)")
+            return resources
+    except Exception as e:
+        logger.error(f"Ошибка загрузки ресурсов из БД: {e}")
+        return []
+
 def save_resources(resources):
+    if USE_DB_FOR_RESOURCES:
+        save_resources_to_db(resources)
+    else:
+        save_resources_to_json(resources)
+
+def save_resources_to_json(resources):
     with file_lock:
         try:
             os.makedirs('data', exist_ok=True)
             with open(DATA_FILE, 'w', encoding='utf-8') as f:
                 json.dump(resources, f, ensure_ascii=False, indent=2)
-            logger.info(f"Сохранено {len(resources)} ресурсов")
+            logger.info(f"Сохранено {len(resources)} ресурсов в JSON")
         except Exception as e:
-            logger.error(f"Ошибка сохранения ресурсов: {e}")
+            logger.error(f"Ошибка сохранения ресурсов в JSON: {e}")
+
+def save_resources_to_db(resources):
+    if not SessionLocal:
+        logger.error("БД не настроена, сохранение невозможно")
+        return
+    try:
+        with SessionLocal() as session:
+            for res in resources:
+                site_key = res.get("name")
+                active = res.get("active", False)
+
+                # Обновляем существующий сайт
+                result = session.execute(text("""
+                    UPDATE sites
+                    SET active = :active,
+                        updated_at = NOW()
+                    WHERE site_key = :site_key
+                """), {"active": active, "site_key": site_key})
+
+                # Если не обновилось — значит сайта нет, можно добавить (опционально)
+                if result.rowcount == 0:
+                    logger.warning(f"Сайт {site_key} не найден в БД при сохранении")
+
+            session.commit()
+            logger.info(f"Обновлён статус активности для {len(resources)} ресурсов в БД")
+    except Exception as e:
+        logger.error(f"Ошибка сохранения ресурсов в БД: {e}")
 
 def load_last_results():
     with file_lock:
@@ -160,6 +283,90 @@ def save_last_results(results):
 
 resources = load_resources()
 last_results = load_last_results()
+
+# ====================== РАБОТА С ИСТОРИЕЙ СТАТЕЙ ======================
+
+def get_known_urls(resource_name: str):
+    """Возвращает set URL-ов уже известных статей для ресурса"""
+    if USE_DB_FOR_ARTICLES:
+        return get_known_urls_from_db(resource_name)
+    else:
+        return get_known_urls_from_json(resource_name)
+
+def get_known_urls_from_json(resource_name: str):
+    last_results = load_last_results()
+    articles = last_results.get(resource_name, [])
+    return {art['url'] for art in articles}
+
+def get_known_urls_from_db(resource_name: str):
+    if not SessionLocal:
+        logger.warning("БД недоступна, возвращаем пустой набор known_urls")
+        return set()
+    try:
+        with SessionLocal() as session:
+            site_id = session.execute(text(
+                "SELECT id FROM sites WHERE site_key = :site_key"
+            ), {"site_key": resource_name}).scalar()
+
+            if not site_id:
+                return set()
+
+            result = session.execute(text(
+                "SELECT url FROM links WHERE site_id = :site_id"
+            ), {"site_id": site_id}).fetchall()
+
+            return {row.url for row in result}
+    except Exception as e:
+        logger.error(f"Ошибка получения known_urls из БД для {resource_name}: {e}")
+        return set()
+
+
+def save_new_articles(resource_name: str, new_articles: list):
+    """Сохраняет новые статьи в JSON или в БД (is_send = false)"""
+    if not new_articles:
+        return
+    if USE_DB_FOR_ARTICLES:
+        save_new_articles_to_db(resource_name, new_articles)
+    else:
+        save_new_articles_to_json(resource_name, new_articles)
+
+def save_new_articles_to_json(resource_name: str, new_articles: list):
+    last_results = load_last_results()
+    if resource_name not in last_results:
+        last_results[resource_name] = []
+    new_articles = [{**art, 'parsed_at': datetime.now().isoformat()} for art in new_articles]
+    last_results[resource_name].extend(new_articles)
+    save_last_results(last_results)
+    logger.info(f"Сохранено {len(new_articles)} новых статей в JSON для {resource_name}")
+
+def save_new_articles_to_db(resource_name: str, new_articles: list):
+    if not SessionLocal:
+        return
+    try:
+        with SessionLocal() as session:
+            site_id = session.execute(text(
+                "SELECT id FROM sites WHERE site_key = :site_key"
+            ), {"site_key": resource_name}).scalar()
+
+            if not site_id:
+                logger.warning(f"Сайт {resource_name} не найден в таблице sites")
+                return
+
+            for art in new_articles:
+                session.execute(text("""
+                    INSERT IGNORE INTO links
+                    (site_id, title, description, url, is_send, created_at, updated_at)
+                    VALUES (:site_id, :title, :description, :url, false, NOW(), NOW())
+                """), {
+                    "site_id": site_id,
+                    "title": art["title"],
+                    "description": f"<a href='{art['url']}'>{art['title']}</a>",
+                    "url": art["url"]
+                })
+            session.commit()
+            logger.info(f"Добавлено {len(new_articles)} новых статей в БД (links) для {resource_name}")
+    except Exception as e:
+        logger.error(f"Ошибка сохранения новых статей в БД: {e}")
 
 # ====================== ПАРСИНГ ======================
 async def parse_resource(resource, limit=20):
@@ -264,6 +471,7 @@ async def parse_resource(resource, limit=20):
     except Exception as e:
         error_msg = f"сайт недоступен: {str(e)}"
         logger.error(f"ОШИБКА парсинга {resource.get('name', 'unknown')}: {error_msg}")
+        await send_error_to_telegram(f"Ошибка парсинга сайта {resource.get('name', 'unknown')}: {error_msg}")
         return [], error_msg
 
 # Новая async функция для получения только HTML (для /debug)
@@ -315,22 +523,27 @@ async def send_new_articles_async():
         logger.info("Запуск автопарсинга — проверяем на новые статьи")
 
         resources = load_resources()
-        last_results = load_last_results()
         if not resources:
             await send_telegram_message("База ресурсов пуста")
             return
 
         all_articles = []
         all_new_articles = []
-        updated_last_results = last_results.copy()
         lines = []
 
         for resource in resources:
-            if resource.get('paused', False):
+            if not resource.get('active', False):
                 logger.info(f"Ресурс {resource['name']} на паузе — пропускаем")
                 continue
+
             name = resource['name']
-            current_items, error_msg = await parse_resource(resource, limit=20)
+            try:
+                current_items, error_msg = await parse_resource(resource, limit=20)
+            except Exception as parse_e:
+                error_msg = f"Неожиданная ошибка парсинга {name}: {str(parse_e)}"
+                logger.error(error_msg)
+                await send_error_to_telegram(error_msg)  # Добавляем отправку в TG
+                current_items = []
 
             lines.append(f"\n<b>📍 {name}</b>\n")
 
@@ -343,6 +556,9 @@ async def send_new_articles_async():
             new_items = []
 
             logger.info(f"\n=== {name.upper()} ===")
+
+            known_urls = get_known_urls(name)   # ← ключевой вызов
+
             for item in current_items:
                 clean_title = item['title']
                 url = item['url']
@@ -353,24 +569,17 @@ async def send_new_articles_async():
                 resource_articles.append({"title": clean_title, "url": url})
                 all_articles.append({"Источник": name, "title": clean_title, "url": url})
 
-                known_articles = updated_last_results.get(name, [])
-                known_urls = {art['url'] for art in known_articles}
-
                 if url not in known_urls:
                     new_items.append({"title": clean_title, "url": url})
                     all_new_articles.append({"Источник": name, "title": clean_title, "url": url})
 
             if new_items:
-                known_articles.extend(new_items)
-                updated_last_results[name] = known_articles
-                logger.info(f"Добавлено {len(new_items)} новых статей в базу для {name}")
+                save_new_articles(name, new_items)   # ← сохранение
 
             logger.info(f"Спаршено {len(resource_articles)} статей с {name} (из них новых: {len(new_items)})")
 
             for art in resource_articles:
                 lines.append(f"• <a href='{art['url']}'>{art['title']}</a>")
-
-        save_last_results(updated_last_results)
 
         if lines:
             message = f"<b>🔥 Свежие статьи ({len(all_articles)} шт.)</b>\n"
@@ -484,101 +693,565 @@ async def main():
         logger.error(error_msg)
         await send_error_to_telegram(error_msg)
 
+# ==================== ФОРМИРОВАНИЕ ДАННЫХ ====================
+
+def get_all_sites():
+    if USE_DB_FOR_RESOURCES:
+        if not SessionLocal:
+            return []
+        try:
+            with SessionLocal() as session:
+                result = session.execute(text("""
+                    SELECT id, site_key, articles_selector, title_selector,
+                           url_selector, active
+                    FROM sites
+                    ORDER BY site_key DESC
+                """)).fetchall()
+                sites = []
+                for row in result:
+                    sites.append({
+                        "id": row.id,
+                        "identifier": row.id,                    # ← для чекбокса (int)
+                        "site_key": row.site_key,
+                        "url": f"https://{row.site_key}",        # ← по умолчанию, как в Laravel
+                        "articles_selector": row.articles_selector,
+                        "title_selector": row.title_selector,
+                        "url_selector": row.url_selector,
+                        "active": bool(row.active)
+                    })
+                return sites
+        except Exception as e:
+            logger.error(f"Ошибка получения сайтов из БД: {e}")
+            return []
+    else:
+        # JSON-режим
+        resources = load_resources_from_json()
+        sites = []
+        for i, r in enumerate(resources):
+            sites.append({
+                "id": i + 1,
+                "identifier": r.get("name"),                 # ← строка (name)
+                "site_key": r.get("name", ""),
+                "url": r.get("url", ""),
+                "articles_selector": r.get("item_selector", ""),
+                "title_selector": r.get("title_selector", ""),
+                "url_selector": r.get("link_selector", ""),
+                "active": r.get("active", False)
+            })
+        return sites
+
+
+def get_all_links():
+    """Возвращает список статей для страницы /links"""
+    if USE_DB_FOR_ARTICLES:
+        if not SessionLocal:
+            return []
+        try:
+            with SessionLocal() as session:
+                result = session.execute(text("""
+                    SELECT l.id, l.title, l.url, l.is_send, l.created_at,
+                           s.site_key as site_name
+                    FROM links l
+                    LEFT JOIN sites s ON l.site_id = s.id
+                    ORDER BY l.created_at DESC
+                """)).fetchall()
+                return [dict(row) for row in result]
+        except Exception as e:
+            logger.error(f"Ошибка получения статей из БД: {e}")
+            return []
+    else:
+        # Режим JSON
+        last_results = load_last_results()
+        links = []
+        link_id = 1
+        for site_name, articles in last_results.items():
+            for art in articles:
+                parsed_at = art.get("parsed_at")
+                created_at = datetime.fromisoformat(parsed_at) if parsed_at else None
+                links.append({
+                    "id": link_id,
+                    "title": art.get("title", ""),
+                    "url": art.get("url", ""),
+                    "is_send": True,  # в JSON режиме считаем все отправленными
+                    "created_at": created_at,
+                    "site_name": site_name
+                })
+                link_id += 1
+        return links
+
+# ==================== ПАГИНАЦИЯ ====================
+
+def get_pagination(total_items, page, per_page):
+    total_pages = ceil(total_items / per_page)
+    page = max(1, min(page, total_pages)) if total_pages > 0 else 1
+    offset = (page - 1) * per_page
+    return {
+        'page': page,
+        'per_page': per_page,
+        'total_pages': total_pages,
+        'total_items': total_items,
+        'has_prev': page > 1,
+        'has_next': page < total_pages,
+        'offset': offset
+    }
+
 # ==================== HTML + РОУТ ====================
+def get_navigation_bar(current_page=''):
+    """Возвращает готовую HTML-навигацию с подставленными значениями"""
+    db_type = 'MySQL' if DB_HOST and 'mysql' in DB_HOST.lower() else 'JSON'
+    resources_mode = 'DB' if USE_DB_FOR_RESOURCES else 'JSON'
+    articles_mode = 'DB' if USE_DB_FOR_ARTICLES else 'JSON'
+
+    return f'''
+<nav style="background: #343a40; padding: 12px 20px; margin-bottom: 20px; color: white;">
+    <div style="max-width: 1400px; margin: 0 auto; display: flex; align-items: center; gap: 30px;">
+        <div style="display: flex; gap: 25px;">
+            <a href="/" style="color: white; text-decoration: none; font-weight: bold; border-bottom: 3px solid {'#0d6efd' if current_page == 'main' else 'transparent'};">Main</a>
+            <a href="/sites" style="color: white; text-decoration: none; font-weight: bold; border-bottom: 3px solid {'#0d6efd' if current_page == 'sites' else 'transparent'};">Resources</a>
+            <a href="/links" style="color: white; text-decoration: none; font-weight: bold; border-bottom: 3px solid {'#0d6efd' if current_page == 'links' else 'transparent'};">Articles</a>
+            <a href="/debug" style="color: white; text-decoration: none; font-weight: bold; border-bottom: 3px solid {'#0d6efd' if current_page == 'debug' else 'transparent'};">Debug HTML</a>
+        </div>
+
+        <div style="margin-left: auto; color: #adb5bd; font-size: 13px;">
+            DB: {db_type} | Resources: {resources_mode} | Articles: {articles_mode}
+        </div>
+    </div>
+</nav>
+'''
+
 HTML = '''
 <!DOCTYPE html>
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
-    <title>Парсер статей + Telegram уведомления</title>
+    <title>Парсер статей</title>
     <style>
-        body { font-family: Arial, sans-serif; max-width: 1200px; margin: 0 auto; padding: 20px; background: #f5f5f5; }
-        h1 { color: #333; text-align: center; }
-        .container { display: flex; gap: 20px; flex-wrap: wrap; }
-        .left { flex: 1; min-width: 300px; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-        .right { flex: 2; min-width: 300px; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        body { font-family: Arial, sans-serif; max-width: 900px; margin: 0 auto; padding: 20px; background: #f5f5f5; }
+        .form-container { background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 15px rgba(0,0,0,0.1); }
         input, button { width: 100%; padding: 12px; margin: 10px 0; font-size: 16px; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; }
-        button { background: #007bff; color: white; cursor: pointer; }
+        button { background: #007bff; color: white; cursor: pointer; font-weight: bold; }
+        button[disabled] { opacity: 0.3; filter: grayscale(1); pointer-events: none; }
         button:hover { background: #0056b3; }
-        .btn-small { padding: 8px 12px; font-size: 14px; width: auto; display: inline-block; margin: 0 5px; }
-        .btn-danger { background: #dc3545; }
-        .btn-danger:hover { background: #c82333; }
-        .btn-pause { background: #ffc107; color: black; }
-        .btn-pause:hover { background: #e0a800; }
-        table { width: 100%; border-collapse: collapse; margin-top: 20px; }
-        th, td { padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }
-        th { background: #007bff; color: white; }
-        tr:hover { background: #f1f1f1; }
-        .error { color: red; background: #ffe6e6; padding: 15px; border-radius: 5px; margin: 10px 0; }
-        .success { color: green; background: #e6ffe6; padding: 15px; border-radius: 5px; margin: 10px 0; }
-        .resource-item { padding: 10px; margin: 10px 0; background: #f8f9fa; border-radius: 5px; border-left: 4px solid #007bff; }
+        .btn-group { display: flex; gap: 10px; }
+        .btn-green { background: #28a745; }
+        .btn-green:hover { background: #218838; }
+        .links { margin: 20px 0; font-size: 16px; }
+        .links a { margin-right: 20px; color: #007bff; text-decoration: none; }
+        .error { color: red; background: #ffe6e6; padding: 15px; border-radius: 5px; }
+        .success { color: green; background: #e6ffe6; padding: 15px; border-radius: 5px; }
     </style>
 </head>
 <body>
-    <h1>Парсер статей + Автоуведомления в Telegram</h1>
-    <div class="container">
-        <div class="left">
-            <h2>Сохранённые ресурсы</h2>
-            <button onclick="location.href='/?new=1'">+ Новый ресурс</button>
-            {% if resources %}
-                {% for r in resources %}
-                <div class="resource-item">
-                    <strong>{{ r.name }}</strong><br>
-                    <small>{{ r.url }}</small>
-                    <div style="margin-top: 8px;">
-                        <button class="btn-small" onclick="parseSaved({{ loop.index0 }})">Спарсить</button>
-                        <button class="btn-small" onclick="editResource({{ loop.index0 }})">Редактировать</button>
-                        <button class="btn-small btn-danger" onclick="deleteResource({{ loop.index0 }})">Удалить</button>
-                        <button class="btn-small btn-pause" onclick="togglePause({{ loop.index0 }})">
-                            {% if r.paused %}Плей{% else %}Пауза{% endif %}
-                        </button>
-                    </div>
-                </div>
-                {% endfor %}
-            {% else %}
-                <p>Пока нет сохранённых ресурсов</p>
-            {% endif %}
-        </div>
+{{ NAVIGATION_BAR | safe }}
 
-        <div class="right">
-            <h2>{% if edit_index is defined %}Редактировать ресурс{% else %}Новый / Текущий ресурс{% endif %}</h2>
+<h1>Создать / Редактировать сайт для парсинга</h1>
 
-            <form id="parseForm" method="post">
-                {% if edit_index is defined %}
-                    <input type="hidden" name="edit_index" value="{{ edit_index }}">
-                {% endif %}
-                <input type="text" name="name" placeholder="Название ресурса" value="{{ resource.name if resource else '' }}" required>
-                <input type="text" name="url" placeholder="URL страницы" value="{{ resource.url if resource else '' }}" required>
-                <input type="text" name="item_selector" placeholder="Селектор айтема" value="{{ resource.item_selector if resource else '' }}" required>
-                <input type="text" name="title_selector" placeholder="Селектор заголовка" value="{{ resource.title_selector if resource else '' }}" required>
-                <input type="text" name="link_selector" placeholder="Селектор ссылки" value="{{ resource.link_selector if resource else '' }}" required>
-
-                <div style="margin: 15px 0; display: flex; gap: 10px; flex-wrap: wrap;">
-                    <button type="submit" name="action" value="parse" style="background: #28a745;">Парсить сейчас</button>
-                    <button type="submit" name="action" value="save" style="background: #007bff;">Сохранить в базу</button>
-                    <button type="button" onclick="document.getElementById('parseForm').reset(); this.form.elements['name'].focus();" style="background: #6c757d;">Очистить форму</button>
-                </div>
-            </form>
-
-            {% if error %}<div class="error">{{ error }}</div>{% endif %}
-            {% if success %}<div class="success">{{ success }}</div>{% endif %}
-
-            {% if table %}
-                <h3>Результат парсинга ({{ count }} статей)</h3>
-                {{ table|safe }}
-                <button onclick="document.getElementById('parseForm').elements['action'].value='save'; document.getElementById('parseForm').submit();">
-                    Добавить этот ресурс в базу
-                </button>
-            {% endif %}
-        </div>
+<div class="form-container">
+    <div class="links">
+        <a href="/sites">→ Все сайты ({{ sites_count }})</a>
+        <a href="/links">→ Все статьи ({{ links_count }})</a>
     </div>
 
-    <script>
-        function parseSaved(i) { location.href = '/?load=' + i; }
-        function editResource(i) { location.href = '/?edit=' + i; }
-        function deleteResource(i) { if(confirm('Удалить навсегда?')) location.href = '/?delete=' + i; }
-        function togglePause(i) { location.href = '/?pause=' + i; }
-    </script>
+    <h2>{% if edit_index is defined %}Редактировать ресурс{% else %}Новый ресурс{% endif %}</h2>
+
+    <form id="parseForm" method="post">
+        {% if site_id %}
+            <input type="hidden" name="site_id" value="{{ site_id }}">
+        {% endif %}
+        {% if edit_index is defined %}
+            <input type="hidden" name="edit_index" value="{{ edit_index }}">
+        {% endif %}
+        <input type="text" name="name" placeholder="Название ресурса (например: smashingmagazine.com)" value="{{ resource.name if resource else '' }}" required>
+        <input type="text" name="url" placeholder="URL страницы[](https://...)" value="{{ resource.url if resource else '' }}" required>
+        <input type="text" name="item_selector" placeholder="Селектор блока статьи (например: .article)" value="{{ resource.item_selector if resource else '' }}" required>
+        <input type="text" name="title_selector" placeholder="Селектор заголовка внутри блока" value="{{ resource.title_selector if resource else '' }}" required>
+        <input type="text" name="link_selector" placeholder="Селектор ссылки внутри блока" value="{{ resource.link_selector if resource else '' }}" required>
+
+        <div class="btn-group" style="margin-top: 20px;">
+            <button type="submit" name="action" value="parse" class="btn-green" id="parseBtn">Parse resource</button>
+            <button type="submit" name="action" value="save">Save resource</button>
+            <button type="button" onclick="clearAll()">Clear all</button>
+        </div>
+    </form>
+
+    <div id="loading" style="display:none; margin: 15px 0; color: #0066cc;">
+        ⏳ Парсинг страницы... Пожалуйста, подождите
+    </div>
+
+    <div id="parseResult"></div>
+
+    {% if error %}<div class="error">{{ error }}</div>{% endif %}
+    {% if success %}<div class="success">{{ success }}</div>{% endif %}
+
+    {% if table %}
+        <div class="table">
+            <h3>Результат парсинга ({{ count }} статей)</h3>
+            {{ table|safe }}
+        </div>
+    {% endif %}
+</div>
+
+<script>
+    function parseSaved(i) { location.href = '/?load=' + i; }
+    function editResource(i) { location.href = '/?edit=' + i; }
+    function deleteResource(i) { if(confirm('Удалить?')) location.href = '/?delete=' + i; }
+
+    document.getElementById('parseBtn').addEventListener('click', async function(e) {
+        e.preventDefault();
+
+        const btn = this;
+        const form = document.getElementById('parseForm');
+        const loading = document.getElementById('loading');
+        const resultDiv = document.getElementById('parseResult');
+
+        // Отключаем кнопку
+        btn.disabled = true;
+        btn.textContent = 'Парсинг...';
+        loading.style.display = 'block';
+        resultDiv.innerHTML = '';
+
+        const formData = new FormData(form);
+
+        try {
+            const response = await fetch('/parse_now', {
+                method: 'POST',
+                body: formData
+            });
+
+            const result = await response.json();
+
+            if (result.success) {
+                resultDiv.innerHTML = `
+                    <h3>Результат парсинга (${result.count} статей)</h3>
+                    ${result.table}
+                `;
+                resultDiv.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            } else {
+                resultDiv.innerHTML = `<div class="error">${result.error}</div>`;
+            }
+
+        } catch (err) {
+            resultDiv.innerHTML = `<div class="error">Ошибка соединения: ${err.message}</div>`;
+        } finally {
+            // Возвращаем кнопку
+            btn.disabled = false;
+            btn.textContent = 'Парсить сейчас';
+            loading.style.display = 'none';
+        }
+    });
+
+    function clearAll() {
+        document.getElementById('parseForm').reset();
+        const resultDiv = document.getElementById('parseResult');
+        if (resultDiv) resultDiv.innerHTML = '';  // Очищаем результаты парсинга
+        document.querySelectorAll('.error, .success, .table').forEach(el => el.remove());  // Очищаем ошибки/успех
+    }
+</script>
+</body>
+</html>
+'''
+
+SITES_HTML = '''
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Сайты - Парсер статей</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }
+        .container { max-width: 1400px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }
+        th { background: #007bff; color: white; position: sticky; top: 0; }
+        tr:hover { background: #f8f9fa; }
+        .pagination { margin: 20px 0; text-align: center; }
+        .pagination a, .pagination span { padding: 8px 12px; margin: 0 4px; border: 1px solid #ddd; text-decoration: none; border-radius: 4px; }
+        .pagination .active { background: #007bff; color: white; border-color: #007bff; }
+        .per-page { margin: 10px 0; }
+        .btn { padding: 6px 12px; border: none; border-radius: 4px; cursor: pointer; font-size: 14px; }
+        .btn-edit { background: #17a2b8; color: white; }
+        .btn-parse { background: #28a745; color: white; }
+        .btn-delete { background: #dc3545; color: white; }
+        .checkbox { transform: scale(1.3); }
+        .active-yes { color: green; font-weight: bold; }
+        .active-no { color: red; }
+        .filter-form { margin-bottom: 20px; display: flex; gap: 10px; }
+        .filter-form input { padding: 8px; flex-grow: 1; border: 1px solid #ddd; border-radius: 4px; }
+        .filter-form button { padding: 8px 16px; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        .filter-form button:hover { background: #0056b3; }
+        .reset-btn { background: #6c757d; }
+        .reset-btn:hover { background: #5a6268; }
+    </style>
+</head>
+<body>
+{{ NAVIGATION_BAR | safe }}
+<div class="container">
+    <h1>Сайты для парсинга <a href="/" style="float:right; font-size:16px;">← Создать новый сайт</a></h1>
+    <p>Всего сайтов: {{ sites_count }}</p>
+
+    {% if USE_DB_FOR_RESOURCES %}
+    <form class="filter-form" method="get">
+        <input type="text" name="search" placeholder="Фильтр по домену..." value="{{ search }}">
+        <input type="hidden" name="per_page" value="{{ pagination.per_page if pagination else '' }}">
+        <input type="hidden" name="page" value="1">
+        <button type="submit">Фильтровать</button>
+        <button type="button" class="reset-btn" onclick="location.href='?per_page={{ pagination.per_page if pagination else '' }}&page=1'">Сброс</button>
+    </form>
+    {% else %}
+    <div class="filter-form">
+        <input type="text" class="filter-input" placeholder="Фильтр по домену... (на лету)" value="">
+        <button type="button" class="reset-btn" onclick="resetFilter()">Сброс</button>
+    </div>
+    {% endif %}
+
+    <div class="per-page">
+        Показывать по:
+        {% for pp in per_page_options %}
+            <a href="?per_page={{ pp }}&page=1{% if search %}&search={{ search }}{% endif %}" class="{% if pp == pagination.per_page %}active{% endif %}">{{ pp }}</a>
+        {% endfor %}
+    </div>
+
+    <table>
+        <thead>
+            <tr>
+                <th>ID</th>
+                <th>Домен</th>
+                <th>URL</th>
+                <th>Articles selector</th>
+                <th>Title selector</th>
+                <th>URL selector</th>
+                <th>Active</th>
+                <th>Действия</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for site in sites %}
+            <tr>
+                <td>{{ site.id }}</td>
+                <td><strong>{{ site.site_key }}</strong></td>
+                <td><a href="{{ site.url }}" target="_blank">{{ site.url }}</a></td>
+                <td><code>{{ site.articles_selector or '-' }}</code></td>
+                <td><code>{{ site.title_selector or '-' }}</code></td>
+                <td><code>{{ site.url_selector or '-' }}</code></td>
+                <td>
+                    <input type="checkbox" class="checkbox" {{ 'checked' if site.active else '' }}
+                           onchange="toggleCheckbox('{{ site.identifier }}', this.checked, {{ USE_DB_FOR_RESOURCES|lower }})">
+                </td>
+                <td>
+                    <a href="/?edit={{ site.id }}" class="btn btn-edit">Редактировать</a>
+                    <a href="/?parse_now={{ site.id }}" class="btn btn-parse">Спарсить</a>
+                    <button onclick="deleteSite({{ site.id }}, '{{ site.site_key }}')" class="btn btn-delete">Удалить</button>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+
+    {% if pagination and pagination.total_pages > 1 %}
+    <div class="pagination">
+        {% if pagination.has_prev %}
+            <a href="?page={{ pagination.page - 1 }}&per_page={{ pagination.per_page }}{% if search %}&search={{ search }}{% endif %}">← Назад</a>
+        {% endif %}
+
+        {% for p in range(1, pagination.total_pages + 1) %}
+            {% if p == pagination.page %}
+                <span class="active">{{ p }}</span>
+            {% elif p == 1 or p == pagination.total_pages or (p >= pagination.page - 2 and p <= pagination.page + 2) %}
+                <a href="?page={{ p }}&per_page={{ pagination.per_page }}{% if search %}&search={{ search }}{% endif %}">{{ p }}</a>
+            {% elif p == pagination.page - 3 or p == pagination.page + 3 %}
+                <span>...</span>
+            {% endif %}
+        {% endfor %}
+
+        {% if pagination.has_next %}
+            <a href="?page={{ pagination.page + 1 }}&per_page={{ pagination.per_page }}{% if search %}&search={{ search }}{% endif %}">Вперёд →</a>
+        {% endif %}
+    </div>
+    {% elif pagination is none %}
+    <p><em>В режиме JSON пагинация отключена (всего сайтов: {{ sites|length }})</em></p>
+    {% endif %}
+</div>
+
+<script>
+function toggleCheckbox(identifier, isActive, isDbMode) {
+    const url = `/sites/toggle?identifier=${encodeURIComponent(identifier)}&active=${isActive}&db=${isDbMode}`;
+    location.href = url;
+}
+
+function deleteSite(id, name) {
+    if (confirm(`Удалить сайт "${name}" и все его ссылки?`)) {
+        fetch('/sites/delete', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({id: id})
+        })
+        .then(() => location.reload());
+    }
+}
+
+{% if not USE_DB_FOR_RESOURCES %}
+document.querySelector('.filter-input').addEventListener('input', function() {
+    let filter = this.value.toLowerCase();
+    document.querySelectorAll('tbody tr').forEach(row => {
+        let domain = row.querySelector('td:nth-child(2) strong').textContent.toLowerCase();
+        row.style.display = domain.includes(filter) ? '' : 'none';
+    });
+});
+
+function resetFilter() {
+    const input = document.querySelector('.filter-input');
+    input.value = '';
+    input.dispatchEvent(new Event('input'));
+}
+{% endif %}
+</script>
+</body>
+</html>
+'''
+
+LINKS_HTML = '''
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Статьи (links) - Парсер</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }
+        .container { max-width: 1400px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }
+        th { background: #6c757d; color: white; position: sticky; top: 0; }
+        tr:hover { background: #f8f9fa; }
+        .pagination { margin: 20px 0; text-align: center; }
+        .pagination a, .pagination span { padding: 8px 12px; margin: 0 4px; border: 1px solid #ddd; text-decoration: none; border-radius: 4px; }
+        .pagination .active { background: #6c757d; color: white; }
+        .per-page { margin: 10px 0; }
+        .btn-delete { background: #dc3545; color: white; padding: 6px 12px; border: none; border-radius: 4px; cursor: pointer; }
+        .send-yes { color: green; font-weight: bold; }
+        .send-no { color: orange; }
+        .title { max-width: 600px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .filter-form { margin-bottom: 20px; display: flex; gap: 10px; }
+        .filter-form input { padding: 8px; flex-grow: 1; border: 1px solid #ddd; border-radius: 4px; }
+        .filter-form button { padding: 8px 16px; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        .filter-form button:hover { background: #0056b3; }
+        .reset-btn { background: #6c757d; }
+        .reset-btn:hover { background: #5a6268; }
+    </style>
+</head>
+<body>
+{{ NAVIGATION_BAR | safe }}
+<div class="container">
+    <h1>Список статей <a href="/" style="float:right; font-size:16px;">← Главная</a></h1>
+    <p>Всего статей: {{ pagination.total_items }}</p>
+
+    {% if USE_DB_FOR_ARTICLES %}
+    <form class="filter-form" method="get">
+        <input type="text" name="search" placeholder="Фильтр по заголовку..." value="{{ search }}">
+        <input type="hidden" name="per_page" value="{{ pagination.per_page }}">
+        <input type="hidden" name="page" value="1">
+        <button type="submit">Фильтровать</button>
+        <button type="button" class="reset-btn" onclick="location.href='?per_page={{ pagination.per_page }}&page=1'">Сброс</button>
+    </form>
+    {% else %}
+    <div class="filter-form">
+        <input type="text" class="filter-input" placeholder="Фильтр по заголовку... (на лету)" value="">
+        <button type="button" class="reset-btn" onclick="resetFilter()">Сброс</button>
+    </div>
+    {% endif %}
+
+    <div class="per-page">
+        Показывать по:
+        {% for pp in per_page_options %}
+            <a href="?per_page={{ pp }}&page=1{% if search %}&search={{ search }}{% endif %}" class="{% if pp == pagination.per_page %}active{% endif %}">{{ pp }}</a>
+        {% endfor %}
+    </div>
+
+    <table>
+        <thead>
+            <tr>
+                <th>ID</th>
+                <th>Заголовок</th>
+                <th>Сайт</th>
+                <th>Отправлено</th>
+                <th>Дата</th>
+                <th>Действия</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for link in links %}
+            <tr>
+                <td>{{ link.id }}</td>
+                <td class="title">
+                    <a href="{{ link.url }}" target="_blank">{{ link.title }}</a>
+                </td>
+                <td>{{ link.site_name or '—' }}</td>
+                <td>
+                    <span class="{% if link.is_send %}send-yes{% else %}send-no{% endif %}">
+                        {{ '✅ Да' if link.is_send else '❌ Нет' }}
+                    </span>
+                </td>
+                <td>{{ link.created_at.strftime('%d %b %y') if link.created_at else '-' }}</td>
+                <td>
+                    <button onclick="deleteLink('{{ link.site_name|replace("'", "\\'") }}', '{{ link.url|replace("'", "\\'") }}')" class="btn-delete">Удалить</button>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+
+    {% if pagination and pagination.total_pages > 1 %}
+    <div class="pagination">
+        {% if pagination.has_prev %}
+            <a href="?page={{ pagination.page - 1 }}&per_page={{ pagination.per_page }}{% if search %}&search={{ search }}{% endif %}">← Назад</a>
+        {% endif %}
+
+        {% for p in range(1, pagination.total_pages + 1) %}
+            {% if p == pagination.page %}
+                <span class="active">{{ p }}</span>
+            {% elif p == 1 or p == pagination.total_pages or (p >= pagination.page - 2 and p <= pagination.page + 2) %}
+                <a href="?page={{ p }}&per_page={{ pagination.per_page }}{% if search %}&search={{ search }}{% endif %}">{{ p }}</a>
+            {% elif p == pagination.page - 3 or p == pagination.page + 3 %}
+                <span>...</span>
+            {% endif %}
+        {% endfor %}
+
+        {% if pagination.has_next %}
+            <a href="?page={{ pagination.page + 1 }}&per_page={{ pagination.per_page }}{% if search %}&search={{ search }}{% endif %}">Вперёд →</a>
+        {% endif %}
+    </div>
+    {% elif pagination is none %}
+    <p><em>В режиме JSON пагинация отключена (всего сайтов: {{ sites|length }})</em></p>
+    {% endif %}
+</div>
+
+<script>
+function deleteLink(site_name, url) {
+    if (confirm(`Удалить статью с URL "${url}"?`)) {
+        fetch('/links/delete', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({site_name: site_name, url: url})
+        })
+        .then(() => location.reload());
+    }
+}
+
+{% if not USE_DB_FOR_ARTICLES %}
+document.querySelector('.filter-input').addEventListener('input', function() {
+    let filter = this.value.toLowerCase();
+    document.querySelectorAll('tbody tr').forEach(row => {
+        let title = row.querySelector('.title a').textContent.toLowerCase();
+        row.style.display = title.includes(filter) ? '' : 'none';
+    });
+});
+
+function resetFilter() {
+    const input = document.querySelector('.filter-input');
+    input.value = '';
+    input.dispatchEvent(new Event('input'));
+}
+{% endif %}
+</script>
 </body>
 </html>
 '''
@@ -593,52 +1266,90 @@ DEBUG_HTML = '''
     <style>
         body { font-family: Arial, sans-serif; max-width: 1200px; margin: 0 auto; padding: 20px; background: #f5f5f5; }
         h2 { color: #333; }
-        input, button { width: 100%; padding: 12px; margin: 10px 0; font-size: 16px; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; }
-        button { background: #28a745; color: white; cursor: pointer; }
+        input[type="text"] { width: calc(100% - 120px); padding: 12px; margin: 10px 0; font-size: 16px; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; }
+        label { display: inline-flex; align-items: center; margin: 10px 0; font-size: 15px; }
+        button { padding: 12px 20px; background: #28a745; color: white; cursor: pointer; border: none; border-radius: 4px; margin: 10px 0; }
         button:hover { background: #218838; }
+        button[disabled] { opacity: 0.3; filter: grayscale(1); pointer-events: none; }
         .error { color: red; background: #ffe6e6; padding: 15px; border-radius: 5px; margin: 10px 0; }
-        .success { color: green; background: #e6ffe6; padding: 15px; border-radius: 5px; margin: 10px 0; }
-        pre { background: #f8f9fa; padding: 15px; border-radius: 5px; overflow: auto; max-height: 600px; }
+        .toolbar { margin: 15px 0; display: flex; gap: 10px; align-items: center; }
+        .copy-btn { background: #007bff; padding: 8px 16px; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        .copy-btn:hover { background: #0056b3; }
+        pre {
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 6px;
+            font-size: 12px; /* Меньший шрифт */
+            line-height: 1.4; /* Переносы и читаемость */
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            max-height: 70vh;
+            overflow: auto;
+            border: 1px solid #ddd;
+        }
     </style>
 </head>
 <body>
+{{ NAVIGATION_BAR | safe }}
     <h2>Debug: Введите URL для получения HTML</h2>
-    <form method="post">
+    <form id="debugForm" method="post">
         <input type="text" name="url" placeholder="URL страницы" value="{{ url if url else '' }}" required>
-        <button type="submit">Получить HTML</button>
+        <label>
+            <input type="checkbox" name="clean_assets" {{ 'checked' if clean_assets else '' }}> Удалить ассеты (скрипты, стили, meta и т.д.)
+        </label>
+        <button type="submit" id="getHtmlBtn">Получить HTML</button>
     </form>
 
-    {% if error %}<div class="error">{{ error }}</div>{% endif %}
+    <div id="loading" style="display:none; margin: 15px 0; color: #0066cc;">
+        ⏳ Загрузка HTML... Пожалуйста, подождите
+    </div>
 
-    {% if html %}
-        <h3>HTML код страницы ({{ html_length }} символов)</h3>
-        <pre>{{ html }}</pre>
-    {% endif %}
+    <div id="debugResult"></div>
+
+<script>
+    function copyHTML() {
+        const codeElement = document.getElementById('htmlCode');
+        if (codeElement) {
+            const rawCode = codeElement.innerHTML.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+            navigator.clipboard.writeText(rawCode).then(() => {
+                alert('Сырой HTML скопирован!');
+            }).catch(err => {
+                alert('Ошибка: ' + err);
+            });
+        }
+    };
+    document.addEventListener('DOMContentLoaded', () => {
+        const form = document.getElementById('debugForm');
+        const btn = document.getElementById('getHtmlBtn');
+        const originalText = btn.textContent;
+
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            btn.disabled = true;
+            btn.textContent = 'Загрузка...';
+            document.getElementById('loading').style.display = 'block';
+            document.getElementById('debugResult').innerHTML = '';
+
+            const formData = new FormData(form);
+            formData.append('ajax', 'true');  // Добавляем индикатор AJAX
+
+            try {
+                const response = await fetch('/debug', { method: 'POST', body: formData });
+                const htmlFragment = await response.text();
+                document.getElementById('debugResult').innerHTML = htmlFragment;
+            } catch (err) {
+                document.getElementById('debugResult').innerHTML = `<div class="error">Ошибка: ${err.message}</div>`;
+            } finally {
+                btn.disabled = false;
+                btn.textContent = originalText;
+                document.getElementById('loading').style.display = 'none';
+            }
+        });
+    });
+</script>
 </body>
 </html>
 '''
-
-@app.route('/debug', methods=['GET', 'POST'])
-def debug():
-    logger.info("Запрос к /debug")
-    url = ''
-    error = None
-    html = None
-    html_length = 0
-
-    if request.method == 'POST':
-        url = request.form['url'].strip()
-        try:
-            html = asyncio.run(get_page_html(url))
-            if 'Ошибка' in html:
-                error = html
-                html = None
-            else:
-                html_length = len(html)
-        except Exception as e:
-            error = f"Ошибка получения HTML: {str(e)}"
-
-    return render_template_string(DEBUG_HTML, url=url, error=error, html=html, html_length=html_length)
 
 @app.route('/', methods=['GET', 'POST'])
 def index():
@@ -647,30 +1358,60 @@ def index():
     resources = load_resources()
 
     edit_index = request.args.get('edit', type=int)
-    load_index = request.args.get('load', type=int)
-    delete_index = request.args.get('delete', type=int)
-    pause_index = request.args.get('pause', type=int)
+    parse_now = request.args.get('parse_now', type=int)
 
     resource = {}
     error = success = table = count = None
 
-    if pause_index is not None and 0 <= pause_index < len(resources):
-        resources[pause_index]['paused'] = not resources[pause_index].get('paused', False)
-        save_resources(resources)
-        success = f"Статус паузы для {resources[pause_index]['name']} изменён"
+    if USE_DB_FOR_RESOURCES:
+        with SessionLocal() as session:
+            sites_count = session.execute(text("SELECT COUNT(*) FROM sites")).scalar() or 0
+    else:
+        sites_count = len(load_resources_from_json())
 
-    if delete_index is not None and 0 <= delete_index < len(resources):
-        deleted = resources.pop(delete_index)
-        save_resources(resources)
-        success = f"Удалён: {deleted['name']}"
+    if USE_DB_FOR_ARTICLES:
+        with SessionLocal() as session:
+            links_count = session.execute(text("SELECT COUNT(*) FROM links")).scalar() or 0
+    else:
+        last_results = load_last_results()
+        links_count = sum(len(articles) for articles in last_results.values())
 
-    if edit_index is not None and 0 <= edit_index < len(resources):
-        resource = resources[edit_index].copy()
-    elif load_index is not None and 0 <= load_index < len(resources):
-        resource = resources[load_index].copy()
+    site_id = None
+    if edit_index is not None or parse_now is not None:
+        target_id = edit_index if edit_index is not None else parse_now
+        all_sites = get_all_sites()
+        target_site = next((s for s in all_sites if s['id'] == target_id), None)
+
+        if target_site:
+            site_id = target_site['id']
+            resource = {
+                "name": target_site['site_key'],
+                "url": target_site.get('url', f"https://{target_site['site_key']}"),
+                "item_selector": target_site.get('articles_selector', ''),
+                "title_selector": target_site.get('title_selector', ''),
+                "link_selector": target_site.get('url_selector', ''),
+                "active": target_site.get('active', False)
+            }
+
+            # Если это parse_now — сразу парсим
+            if parse_now is not None:
+                try:
+                    data, parse_error = asyncio.run(parse_resource(resource, limit=20))
+                    if parse_error:
+                        error = f"Ошибка парсинга: {parse_error}"
+                    elif not data:
+                        error = "Ничего не найдено по указанным селекторам"
+                    else:
+                        df = pd.DataFrame([{"Заголовок": art['title'], "Ссылка": f"<a href='{art['url']}'>{art['url']}</a>"} for art in data])
+                        table = df.to_html(escape=False, index=False)
+                        count = len(data)
+                        success = f"Успешно спаршено {count} статей с {resource['name']}!"
+                except Exception as e:
+                    error = f"Ошибка парсинга: {str(e)}"
 
     if request.method == 'POST':
         action = request.form.get('action')
+        site_id_from_form = request.form.get('site_id', type=int)
 
         current_form = {
             "name": request.form['name'].strip(),
@@ -678,47 +1419,380 @@ def index():
             "item_selector": request.form['item_selector'].strip(),
             "title_selector": request.form['title_selector'].strip(),
             "link_selector": request.form['link_selector'].strip(),
-            "paused": False
+            "active": resource.get('active', False)  # Сохраняем оригинальное значение active, для нового - False
         }
 
-        edit_idx = request.form.get('edit_index')
-
         if action == "save":
-            if edit_idx and edit_idx.isdigit() and int(edit_idx) < len(resources):
-                old_name = resources[int(edit_idx)]['name']
-                resources[int(edit_idx)] = current_form
-                save_resources(resources)
-                success = f"Обновлён: {old_name} → {current_form['name']}"
+            if USE_DB_FOR_RESOURCES and site_id_from_form:
+                # DB-режим: обновляем существующий сайт
+                try:
+                    with SessionLocal() as session:
+                        session.execute(text("""
+                            UPDATE sites
+                            SET site_key = :site_key,
+                                articles_selector = :articles_selector,
+                                title_selector = :title_selector,
+                                url_selector = :url_selector,
+                                updated_at = NOW()
+                            WHERE id = :id
+                        """), {
+                            "site_key": current_form["name"],
+                            "articles_selector": current_form["item_selector"],
+                            "title_selector": current_form["title_selector"],
+                            "url_selector": current_form["link_selector"],
+                            "id": site_id_from_form
+                        })
+                        session.commit()
+                    success = f"Сайт обновлён: {current_form['name']}"
+                except Exception as e:
+                    error = f"Ошибка обновления в БД: {str(e)}"
             else:
-                resources.append(current_form)
-                save_resources(resources)
-                success = f"Добавлен: {current_form['name']}"
-
-        elif action == "parse":
-            resource = current_form
-
-            try:
-                data, parse_error = asyncio.run(parse_resource(current_form, limit=20))
-                if parse_error:
-                    error = f"Ошибка парсинга: {parse_error}"
-                elif not data:
-                    error = "Ничего не найдено по указанным селекторам"
+                # JSON-режим (или новый сайт)
+                if edit_index is not None:
+                    # обновление в JSON
+                    resources[edit_index - 1] = current_form
+                    save_resources(resources)
+                    success = f"Обновлён: {current_form['name']}"
                 else:
-                    df = pd.DataFrame([{"Заголовок": art['title'], "Ссылка": f"<a href='{art['url']}'>{art['url']}</a>"} for art in data])
-                    table = df.to_html(escape=False, index=False)
-                    count = len(data)
-                    success = f"Успешно спаршено {len(data)} статей!"
-            except Exception as e:
-                error = f"Ошибка парсинга: {str(e)}"
+                    resources.append(current_form)
+                    save_resources(resources)
+                    success = f"Добавлен новый ресурс: {current_form['name']}"
+                    edit_index = len(resources)  # Устанавливаем edit_index для нового ресурса
+
+            # После сохранения обновляем resource текущими значениями формы
+            if success:
+                resource = current_form
+
+                # Пересчитываем sites_count
+                if USE_DB_FOR_RESOURCES:
+                    with SessionLocal() as session:
+                        sites_count = session.execute(text("SELECT COUNT(*) FROM sites")).scalar() or 0
+                else:
+                    resources = load_resources()  # Перезагружаем
+                    sites_count = len(resources)
 
     return render_template_string(HTML,
-                                  resources=resources,
                                   resource=resource,
-                                  edit_index=edit_index if 'edit_index' in locals() else None,
+                                  edit_index=edit_index,
+                                  site_id=site_id,                    # ← передаём в шаблон
                                   error=error,
                                   success=success,
                                   table=table,
-                                  count=count)
+                                  count=count,
+                                  NAVIGATION_BAR=get_navigation_bar('main'),
+                                  sites_count=sites_count,
+                                  links_count=links_count)
+
+@app.route('/parse_now', methods=['POST'])
+def parse_now():
+    try:
+        site_id = request.form.get('site_id', type=int)
+        resource = None
+
+        # Если передан site_id — загружаем существующий ресурс
+        if site_id:
+            all_sites = get_all_sites()
+            target = next((s for s in all_sites if s['id'] == site_id), None)
+            if target:
+                resource = {
+                    "name": target['site_key'],
+                    "url": f"https://{target['site_key']}",
+                    "item_selector": target.get('articles_selector', ''),
+                    "title_selector": target.get('title_selector', ''),
+                    "link_selector": target.get('url_selector', ''),
+                }
+
+        # Если не нашли по ID — берём данные из формы
+        if not resource:
+            resource = {
+                "name": request.form['name'].strip(),
+                "url": request.form['url'].strip(),
+                "item_selector": request.form['item_selector'].strip(),
+                "title_selector": request.form['title_selector'].strip(),
+                "link_selector": request.form['link_selector'].strip(),
+            }
+
+        data, parse_error = asyncio.run(parse_resource(resource, limit=20))
+
+        if parse_error:
+            return {"success": False, "error": parse_error}
+        if not data:
+            return {"success": False, "error": "Ничего не найдено по указанным селекторам"}
+
+        df = pd.DataFrame([{"Заголовок": art['title'], "Ссылка": f"<a href='{art['url']}'>{art['url']}</a>"} for art in data])
+        table_html = df.to_html(escape=False, index=False)
+
+        return {
+            "success": True,
+            "count": len(data),
+            "table": table_html,
+            "resource_name": resource.get("name")
+        }
+
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+@app.route('/sites')
+def sites_list():
+    search = request.args.get('search', '').strip().lower()
+
+    if USE_DB_FOR_RESOURCES:
+        # БД-режим с пагинацией и серверным поиском
+        page = request.args.get('page', 1, type=int)
+        per_page = request.args.get('per_page', DEFAULT_PER_PAGE, type=int)
+        if per_page not in PER_PAGE_OPTIONS:
+            per_page = DEFAULT_PER_PAGE
+
+        with SessionLocal() as session:
+            if search:
+                total_query = text("SELECT COUNT(*) FROM sites WHERE LOWER(site_key) LIKE :search")
+                total = session.execute(total_query, {"search": f"%{search}%"}).scalar() or 0
+                result_query = text("""
+                    SELECT id, site_key, articles_selector, title_selector, url_selector,
+                           active, created_at
+                    FROM sites
+                    WHERE LOWER(site_key) LIKE :search
+                    ORDER BY created_at DESC
+                    LIMIT :limit OFFSET :offset
+                """)
+            else:
+                total_query = text("SELECT COUNT(*) FROM sites")
+                total = session.execute(total_query).scalar() or 0
+                result_query = text("""
+                    SELECT id, site_key, articles_selector, title_selector, url_selector,
+                           active, created_at
+                    FROM sites
+                    ORDER BY created_at DESC
+                    LIMIT :limit OFFSET :offset
+                """)
+
+            pagination = get_pagination(total, page, per_page)
+
+            result = session.execute(result_query, {"limit": per_page, "offset": pagination['offset'], "search": f"%{search}%"} if search else {"limit": per_page, "offset": pagination['offset']}).fetchall()
+
+            sites = [dict(row) for row in result]
+            for site in sites:
+                site['url'] = f"https://{site['site_key']}"
+            sites_count = total
+    else:
+        # JSON-режим: загружаем все, сортируем по алфавиту, пагинация отключена, фильтр на клиенте
+        all_sites = get_all_sites()
+        all_sites = sorted(all_sites, key=lambda s: s['site_key'].lower())
+        sites = all_sites
+        pagination = None
+        sites_count = len(sites)
+        per_page_options = PER_PAGE_OPTIONS
+
+    return render_template_string(SITES_HTML,
+                                      sites=sites,
+                                      pagination=pagination,
+                                      per_page_options=per_page_options,
+                                      sites_count=sites_count,
+                                      NAVIGATION_BAR=get_navigation_bar('sites'),
+                                      USE_DB_FOR_RESOURCES=USE_DB_FOR_RESOURCES,
+                                      search=search)
+
+@app.route('/sites/toggle')
+def sites_toggle():
+    identifier = request.args.get('identifier')
+    active_str = request.args.get('active', 'true')
+    active = active_str.lower() in ('true', '1', 'on')
+    is_db_mode = request.args.get('db', 'false').lower() == 'true'
+
+    if not identifier:
+        return redirect('/sites')
+
+    if is_db_mode:
+        # БД-режим
+        if not SessionLocal:
+            return redirect('/sites')
+        try:
+            with SessionLocal() as session:
+                session.execute(text("""
+                    UPDATE sites
+                    SET active = :active, updated_at = NOW()
+                    WHERE id = :id
+                """), {"active": 1 if active else 0, "id": int(identifier)})
+                session.commit()
+            logger.info(f"DB toggle: site_id={identifier} → active={active}")
+        except Exception as e:
+            logger.error(f"Ошибка toggle в БД: {e}")
+    else:
+        # JSON-режим
+        resources = load_resources_from_json()
+        updated = False
+        for res in resources:
+            if res.get("name") == identifier:
+                res['active'] = active
+                updated = True
+                break
+        if updated:
+            save_resources_to_json(resources)
+            logger.info(f"JSON toggle: '{identifier}' → active={active}")
+        else:
+            logger.warning(f"JSON: ресурс '{identifier}' не найден")
+
+    return redirect('/sites')
+
+
+@app.route('/sites/delete', methods=['POST'])
+def delete_site():
+    data = request.get_json()
+    site_id = data.get('id')
+
+    if not site_id:
+        return {'error': 'no id'}, 400
+
+    if USE_DB_FOR_RESOURCES:
+        with SessionLocal() as session:
+            session.execute(text("DELETE FROM sites WHERE id = :id"), {"id": site_id})
+            session.commit()
+    else:
+        # JSON-режим
+        resources = load_resources_from_json()
+        if 1 <= site_id <= len(resources):
+            del_resource = resources.pop(site_id - 1)
+            save_resources_to_json(resources)
+
+    return {'success': True}
+
+@app.route('/links')
+def links_list():
+    search = request.args.get('search', '').strip().lower()
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', DEFAULT_PER_PAGE, type=int)
+    if per_page not in PER_PAGE_OPTIONS:
+        per_page = DEFAULT_PER_PAGE
+
+    if USE_DB_FOR_ARTICLES:
+        # БД-режим с пагинацией и серверным поиском
+        with SessionLocal() as session:
+            if search:
+                total_query = text("SELECT COUNT(*) FROM links WHERE LOWER(title) LIKE :search")
+                total = session.execute(total_query, {"search": f"%{search}%"}).scalar() or 0
+                result_query = text("""
+                    SELECT l.id, l.title, l.url, l.is_send, l.created_at,
+                           COALESCE(s.site_key, '—') as site_name
+                    FROM links l
+                    LEFT JOIN sites s ON l.site_id = s.id
+                    WHERE LOWER(l.title) LIKE :search
+                    ORDER BY l.created_at DESC
+                    LIMIT :limit OFFSET :offset
+                """)
+            else:
+                total_query = text("SELECT COUNT(*) FROM links")
+                total = session.execute(total_query).scalar() or 0
+                result_query = text("""
+                    SELECT l.id, l.title, l.url, l.is_send, l.created_at,
+                           COALESCE(s.site_key, '—') as site_name
+                    FROM links l
+                    LEFT JOIN sites s ON l.site_id = s.id
+                    ORDER BY l.created_at DESC
+                    LIMIT :limit OFFSET :offset
+                """)
+
+            pagination = get_pagination(total, page, per_page)
+            links_count = total
+
+            result = session.execute(result_query, {"limit": per_page, "offset": pagination['offset'], "search": f"%{search}%"} if search else {"limit": per_page, "offset": pagination['offset']}).fetchall()
+
+            links = [dict(row) for row in result]
+            per_page_options = PER_PAGE_OPTIONS
+    else:
+        # JSON-режим
+        all_links = get_all_links()
+        all_links.sort(key=lambda l: l['created_at'] or datetime.min, reverse=True)
+        links_count = len(all_links)
+        pagination = get_pagination(links_count, page, per_page)
+        start = pagination['offset']
+        links = all_links[start:start + per_page]          # ← исправлено
+        per_page_options = PER_PAGE_OPTIONS
+
+    return render_template_string(LINKS_HTML,
+                                  links=links,
+                                  pagination=pagination,
+                                  per_page_options=per_page_options,
+                                  links_count=links_count,
+                                  NAVIGATION_BAR=get_navigation_bar('links'),
+                                  USE_DB_FOR_ARTICLES=USE_DB_FOR_ARTICLES,
+                                  search=search)
+
+@app.route('/links/delete', methods=['POST'])
+def delete_link():
+    data = request.get_json()
+    site_name = data.get('site_name')
+    url = data.get('url')
+
+    if not (site_name and url):
+        return {'error': 'no params'}, 400
+
+    if USE_DB_FOR_ARTICLES:
+        with SessionLocal() as session:
+            session.execute(text("DELETE FROM links WHERE url = :url"), {"url": url})
+            session.commit()
+    else:
+        last_results = load_last_results()
+        if site_name in last_results:
+            last_results[site_name] = [art for art in last_results[site_name] if art['url'] != url]
+            save_last_results(last_results)
+
+    return {'success': True}
+
+
+@app.route('/debug', methods=['GET', 'POST'])
+def debug():
+    logger.info("Запрос к /debug")
+    url = ''
+    error = None
+    html = None
+    html_length = 0
+    clean_assets = False
+
+    is_ajax = request.form.get('ajax') == 'true'
+
+    if request.method == 'POST':
+        url = request.form['url'].strip()
+        clean_assets = 'clean_assets' in request.form
+        try:
+            raw_html = asyncio.run(get_page_html(url))
+            if 'Ошибка' in raw_html:
+                error = raw_html
+            else:
+                if clean_assets:
+                    soup = BeautifulSoup(raw_html, 'lxml')
+                    for tag in soup(['script', 'style', 'link', 'meta', 'noscript', 'iframe', 'svg']):
+                        tag.decompose()
+                    html = soup.prettify()
+                else:
+                    html = BeautifulSoup(raw_html, 'lxml').prettify()
+                html_length = len(html)
+        except Exception as e:
+            error = f"Ошибка получения HTML: {str(e)}"
+
+        if is_ajax:
+            # Возвращаем только фрагмент для #debugResult
+            if error:
+                return '<div class="error">' + error + '</div>'
+            if html:
+                escaped_html = escape(html)
+                return f'''
+<div class="toolbar">
+    <button class="copy-btn" onclick="copyHTML()">📋 Скопировать</button>
+    <span>Длина: {html_length} символов</span>
+</div>
+<pre id="htmlCode">{escaped_html}</pre>
+'''
+            return ''
+
+    # Для обычного GET/POST возвращаем полный шаблон
+    return render_template_string(DEBUG_HTML,
+                                  NAVIGATION_BAR=get_navigation_bar('debug'),
+                                  url=url,
+                                  error=error,
+                                  html=html,
+                                  html_length=html_length,
+                                  clean_assets=clean_assets)
+
 
 if __name__ == '__main__':
     logger.info("=== ЗАПУСК ПАРСЕРА (Flask + Async Scheduler) ===")
