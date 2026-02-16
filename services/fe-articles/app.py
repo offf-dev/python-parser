@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 import atexit  # Для обработки выхода/краша
 import traceback  # Для стека ошибок
 
-from flask import Flask, request, render_template_string, redirect, url_for, flash
+from flask import Flask, request, render_template_string, redirect, url_for, flash, jsonify
 from math import ceil
 from bs4 import BeautifulSoup, MarkupResemblesLocatorWarning
 from urllib.parse import urljoin
@@ -39,6 +39,8 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.exc import SQLAlchemyError
 
 from html import escape
+
+import random  # Добавлено для random.sleep в parse_resource
 
 # ====================== LOGGING ======================
 def setup_logging():
@@ -118,14 +120,13 @@ def get_db_engine():
         logger.warning("Не все параметры БД указаны")
         return None
 
-    # MySQL подключение
     connection_string = f"mysql+pymysql://{DB_USERNAME}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_DATABASE}"
 
-    # Добавляем параметры для лучшей совместимости
+    connect_args = {"charset": "utf8mb4"}
     if DB_USE_SSL:
-        connection_string += "?ssl_verify_cert=false&ssl_verify_server_cert=false"
+        connect_args["ssl"] = {"ssl_verify_cert": False, "ssl_verify_identity": False}
     else:
-        connection_string += "?ssl_verify_cert=false"
+        connect_args["ssl_disabled"] = True
 
     return create_engine(
         connection_string,
@@ -133,12 +134,18 @@ def get_db_engine():
         pool_recycle=3600,
         pool_size=10,
         max_overflow=20,
-        echo=False,
-        connect_args={"charset": "utf8mb4"}
+        echo=False,  # ← Логирование SQL в консоль/лог
+        connect_args=connect_args
     )
 
 engine = get_db_engine()
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine) if engine else None
+
+# ====================== Проверка и корректировка режимов БД ======================
+if engine is None and (USE_DB_FOR_RESOURCES or USE_DB_FOR_ARTICLES):
+    logger.warning("Движок БД не создан (параметры неверны или отсутствуют). Отключаем режимы БД и переходим на JSON.")
+    USE_DB_FOR_RESOURCES = False
+    USE_DB_FOR_ARTICLES = False
 
 # ====================== ИНИЦИАЛИЗАЦИЯ БОТОВ ======================
 articles_app = None
@@ -198,6 +205,39 @@ async def send_error_to_telegram(error_msg: str):
         error_msg = f"НЕ УДАЛОСЬ отправить сообщение об ошибке в Telegram (логи): {e}"
         logger.error(error_msg)
 
+# ====================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ БД ======================
+def extract_domain(url: str) -> str:
+    """Извлекает голый домен из URL."""
+    url = re.sub(r'^https?://', '', url)
+    url = re.sub(r'^www\.', '', url)
+    domain = url.split('/')[0]
+    return domain
+
+def find_or_create_domain(name: str):
+    """Находит или создаёт домен в таблице domains, возвращает id."""
+    if not SessionLocal:
+        return None
+    try:
+        with SessionLocal() as session:
+            domain_id = session.execute(text(
+                "SELECT id FROM domains WHERE name = :name"
+            ), {"name": name}).scalar()
+
+            if not domain_id:
+                logger.info(f"Создание нового домена: {name}")
+                session.execute(text("""
+                    INSERT INTO domains (name, created_at, updated_at)
+                    VALUES (:name, NOW(), NOW())
+                """), {"name": name})
+                session.commit()
+                domain_id = session.execute(text("SELECT LAST_INSERT_ID()")).scalar()
+                logger.info(f"Создан домен id={domain_id}")
+
+            return domain_id
+    except Exception as e:
+        logger.error(f"Ошибка find_or_create_domain для {name}: {e}\n{traceback.format_exc()}")
+        return None
+
 # ====================== ФАЙЛЫ ======================
 def load_resources():
     if USE_DB_FOR_RESOURCES:
@@ -206,7 +246,6 @@ def load_resources():
         return load_resources_from_json()
 
 def load_resources_from_json():
-    # ваш текущий код load_resources()
     with file_lock:
         try:
             if os.path.exists(DATA_FILE):
@@ -230,7 +269,7 @@ def load_resources_from_db():
     try:
         with SessionLocal() as session:
             result = session.execute(text("""
-                SELECT id, site_key, articles_selector, title_selector,
+                SELECT id, site_key, site_url AS url, articles_selector, title_selector,
                        url_selector, active
                 FROM sites
                 WHERE active = 1
@@ -240,7 +279,7 @@ def load_resources_from_db():
             for row in result:
                 resources.append({
                     "name": row.site_key,
-                    "url": f"https://{row.site_key}",                    # ← по умолчанию, как в Laravel
+                    "url": row.url,
                     "item_selector": row.articles_selector,
                     "title_selector": row.title_selector,
                     "link_selector": row.url_selector,
@@ -278,7 +317,7 @@ def save_resources_to_db(resources):
                 site_key = res.get("name")
                 active = res.get("active", False)
 
-                # Обновляем существующий сайт
+                # Обновляем существующий сайт (только active)
                 result = session.execute(text("""
                     UPDATE sites
                     SET active = :active,
@@ -286,7 +325,6 @@ def save_resources_to_db(resources):
                     WHERE site_key = :site_key
                 """), {"active": active, "site_key": site_key})
 
-                # Если не обновилось — значит сайта нет, можно добавить (опционально)
                 if result.rowcount == 0:
                     logger.warning(f"Сайт {site_key} не найден в БД при сохранении")
 
@@ -323,7 +361,7 @@ last_results = load_last_results()
 # ====================== РАБОТА С ИСТОРИЕЙ СТАТЕЙ ======================
 
 def get_known_urls(resource_name: str):
-    """Возвращает set URL-ов уже известных статей для ресурса"""
+    """Возвращает set URL-ов уже известных статей."""
     if USE_DB_FOR_ARTICLES:
         return get_known_urls_from_db(resource_name)
     else:
@@ -334,28 +372,23 @@ def get_known_urls_from_json(resource_name: str):
     articles = last_results.get(resource_name, [])
     return {art['url'] for art in articles}
 
-def get_known_urls_from_db(resource_name: str):
+def get_known_urls_from_db(resource_name: str = None):
+    """Для DB - глобальный set всех url из links (игнорирует resource_name)."""
     if not SessionLocal:
         logger.warning("БД недоступна, возвращаем пустой набор known_urls")
         return set()
     try:
         with SessionLocal() as session:
-            site_id = session.execute(text(
-                "SELECT id FROM sites WHERE site_key = :site_key"
-            ), {"site_key": resource_name}).scalar()
-
-            if not site_id:
-                return set()
-
+            # ← ВАЖНО: .mappings() + row['url']
             result = session.execute(text(
-                "SELECT url FROM links WHERE site_id = :site_id"
-            ), {"site_id": site_id}).fetchall()
-
-            return {row.url for row in result}
+                "SELECT url FROM links"
+            )).mappings().fetchall()
+            known = {row['url'] for row in result}
+            logger.info(f"Загружено {len(known)} известных URL из БД")
+            return known
     except Exception as e:
-        logger.error(f"Ошибка получения known_urls из БД для {resource_name}: {e}")
+        logger.error(f"Ошибка получения known_urls из БД: {e}\n{traceback.format_exc()}")
         return set()
-
 
 def save_new_articles(resource_name: str, new_articles: list):
     """Сохраняет новые статьи в JSON или в БД (is_send = false)"""
@@ -370,39 +403,72 @@ def save_new_articles_to_json(resource_name: str, new_articles: list):
     last_results = load_last_results()
     if resource_name not in last_results:
         last_results[resource_name] = []
-    new_articles = [{**art, 'parsed_at': datetime.now().isoformat()} for art in new_articles]
+    new_articles = [{**art, 'parsed_at': datetime.now().isoformat(), 'is_send': False} for art in new_articles]  # ИСПРАВЛЕНО: добавлено 'is_send': False
     last_results[resource_name].extend(new_articles)
     save_last_results(last_results)
     logger.info(f"Сохранено {len(new_articles)} новых статей в JSON для {resource_name}")
 
 def save_new_articles_to_db(resource_name: str, new_articles: list):
-    if not SessionLocal:
+    if not SessionLocal or not new_articles:
         return
     try:
+        added_count = 0
         with SessionLocal() as session:
-            site_id = session.execute(text(
-                "SELECT id FROM sites WHERE site_key = :site_key"
-            ), {"site_key": resource_name}).scalar()
-
+            # Получаем site_id по resource_name (site_key)
+            site_id = session.execute(text("SELECT id FROM sites WHERE site_key = :site_key"), {"site_key": resource_name}).scalar()
             if not site_id:
-                logger.warning(f"Сайт {resource_name} не найден в таблице sites")
+                logger.error(f"Не найден site_id для resource_name={resource_name}")
                 return
 
             for art in new_articles:
-                session.execute(text("""
-                    INSERT IGNORE INTO links
-                    (site_id, title, description, url, is_send, created_at, updated_at)
-                    VALUES (:site_id, :title, :description, :url, false, NOW(), NOW())
+                # Проверка на существование
+                exists = session.execute(text("SELECT 1 FROM links WHERE url = :url"), {"url": art["url"]}).scalar()
+                if exists:
+                    logger.info(f"✗ Уже существует в БД: {art['url']}")
+                    continue
+
+                # ИСПРАВЛЕНО: вычисляем domain_id для статьи (из ее url, не site_id)
+                domain_name = extract_domain(art["url"])
+                domain_id = find_or_create_domain(domain_name)
+                if not domain_id:
+                    logger.error(f"Не удалось получить domain_id для {art['url']}")
+                    continue
+
+                logger.info(f"Вставка статьи: title={art['title']}, url={art['url']}, domain_id={domain_id}, site_id={site_id}")
+
+                result = session.execute(text("""
+                    INSERT INTO links
+                    (domain_id, site_id, title, description, url, is_send, created_at, updated_at)
+                    VALUES (:domain_id, :site_id, :title, :description, :url, false, NOW(), NOW())
                 """), {
+                    "domain_id": domain_id,
                     "site_id": site_id,
                     "title": art["title"],
-                    "description": f"<a href='{art['url']}'>{art['title']}</a>",
+                    "description": f"<a href='{art['url']}'>{art['title']}</a>",  # Оставил, как было
                     "url": art["url"]
                 })
+                if result.rowcount > 0:
+                    added_count += 1
+                    logger.info(f"✓ ВСТАВЛЕНО: {art['url']} (rowcount={result.rowcount})")
+                else:
+                    logger.warning(f"✗ Не вставлено (rowcount=0): {art['url']}")
+
             session.commit()
-            logger.info(f"Добавлено {len(new_articles)} новых статей в БД (links) для {resource_name}")
+            logger.info(f"Коммит завершён, добавлено {added_count} из {len(new_articles)}")
+
+            if added_count > 0:
+                test_url = new_articles[0]["url"]
+                check = session.execute(text("SELECT id, title FROM links WHERE url = :url"), {"url": test_url}).mappings().first()
+                if check:
+                    logger.info(f"✓ Найдено после commit: id={check['id']}, title={check['title']}")
+                else:
+                    logger.error(f"✗ НЕ НАЙДЕНО после commit: {test_url}")
+
+    except SQLAlchemyError as sqle:
+        session.rollback()
+        logger.error(f"SQLAlchemy ошибка при вставке: {sqle}\n{traceback.format_exc()}")
     except Exception as e:
-        logger.error(f"Ошибка сохранения новых статей в БД: {e}")
+        logger.error(f"Общая ошибка сохранения: {e}\n{traceback.format_exc()}")
 
 # ====================== ПАРСИНГ ======================
 async def parse_resource(resource, limit=20):
@@ -569,6 +635,12 @@ async def send_new_articles_async():
         all_new_articles = []
         lines = []
 
+        if USE_DB_FOR_ARTICLES:
+            global_known_urls = get_known_urls_from_db()
+            logger.info(f"Глобальный known_urls на старте: {len(global_known_urls)} записей")
+        else:
+            global_known_urls = set()
+
         for resource in resources:
             if not resource.get('active', False):
                 logger.info(f"Ресурс {resource['name']} на паузе — пропускаем")
@@ -600,7 +672,8 @@ async def send_new_articles_async():
 
             logger.info(f"\n=== {name.upper()} ===")
 
-            known_urls = get_known_urls(name)   # ← ключевой вызов
+            # known_urls: глобальные для DB, per-resource для JSON
+            known_urls = global_known_urls if USE_DB_FOR_ARTICLES else get_known_urls(name)
 
             for item in current_items:
                 clean_title = item['title']
@@ -748,10 +821,10 @@ def get_all_sites():
         try:
             with SessionLocal() as session:
                 result = session.execute(text("""
-                    SELECT id, site_key, articles_selector, title_selector,
+                    SELECT id, site_key, site_url AS url, articles_selector, title_selector,
                            url_selector, active
                     FROM sites
-                    ORDER BY site_key DESC
+                    ORDER BY CASE WHEN articles_selector IS NULL THEN 1 ELSE 0 END, updated_at DESC
                 """)).fetchall()
                 sites = []
                 for row in result:
@@ -759,7 +832,7 @@ def get_all_sites():
                         "id": row.id,
                         "identifier": row.id,                    # ← для чекбокса (int)
                         "site_key": row.site_key,
-                        "url": f"https://{row.site_key}",        # ← по умолчанию, как в Laravel
+                        "url": row.url,
                         "articles_selector": row.articles_selector,
                         "title_selector": row.title_selector,
                         "url_selector": row.url_selector,
@@ -788,7 +861,6 @@ def get_all_sites():
 
 
 def get_all_links():
-    """Возвращает список статей для страницы /links"""
     if USE_DB_FOR_ARTICLES:
         if not SessionLocal:
             return []
@@ -796,14 +868,18 @@ def get_all_links():
             with SessionLocal() as session:
                 result = session.execute(text("""
                     SELECT l.id, l.title, l.url, l.is_send, l.created_at,
-                           s.site_key as site_name
+                           COALESCE(d.name, '—') as site_name
                     FROM links l
-                    LEFT JOIN sites s ON l.site_id = s.id
-                    ORDER BY l.created_at DESC
-                """)).fetchall()
-                return [dict(row) for row in result]
+                    LEFT JOIN domains d ON l.domain_id = d.id
+                    ORDER BY l.id DESC  # ← Изменил на id DESC для сортировки по ID
+                """)).mappings().fetchall()
+                links = [dict(row) for row in result]
+                logger.info(f"Загружено {len(links)} статей из БД для /links")
+                if links:
+                    logger.info(f"Первые 5 URL: {[link['url'] for link in links[:5]]}")
+                return links
         except Exception as e:
-            logger.error(f"Ошибка получения статей из БД: {e}")
+            logger.error(f"Ошибка получения статей из БД: {e}\n{traceback.format_exc()}")
             return []
     else:
         # Режим JSON
@@ -818,7 +894,7 @@ def get_all_links():
                     "id": link_id,
                     "title": art.get("title", ""),
                     "url": art.get("url", ""),
-                    "is_send": True,  # в JSON режиме считаем все отправленными
+                    "is_send": art.get("is_send", False),  # ИСПРАВЛЕНО: get("is_send", False)
                     "created_at": created_at,
                     "site_name": site_name
                 })
@@ -901,14 +977,14 @@ HTML = '''
     <h2>{% if edit_index is defined %}Редактировать ресурс{% else %}Новый ресурс{% endif %}</h2>
 
     <form id="parseForm" method="post">
-        {% if site_id %}
-            <input type="hidden" name="site_id" value="{{ site_id }}">
+        {% if link_id %}
+            <input type="hidden" name="link_id" value="{{ link_id }}">
         {% endif %}
         {% if edit_index is defined %}
             <input type="hidden" name="edit_index" value="{{ edit_index }}">
         {% endif %}
         <input type="text" name="name" placeholder="Название ресурса (например: smashingmagazine.com)" value="{{ resource.name if resource else '' }}" required>
-        <input type="text" name="url" placeholder="URL страницы[](https://...)" value="{{ resource.url if resource else '' }}" required>
+        <input type="text" name="url" placeholder="URL страниц[](https://...)" value="{{ resource.url if resource else '' }}" required>
         <input type="text" name="item_selector" placeholder="Селектор блока статьи (например: .article)" value="{{ resource.item_selector if resource else '' }}" required>
         <input type="text" name="title_selector" placeholder="Селектор заголовка внутри блока" value="{{ resource.title_selector if resource else '' }}" required>
         <input type="text" name="link_selector" placeholder="Селектор ссылки внутри блока" value="{{ resource.link_selector if resource else '' }}" required>
@@ -989,14 +1065,15 @@ HTML = '''
     function clearAll() {
         document.getElementById('parseForm').reset();
         const resultDiv = document.getElementById('parseResult');
-        if (resultDiv) resultDiv.innerHTML = '';  // Очищаем результаты парсинга
-        document.querySelectorAll('.error, .success, .table').forEach(el => el.remove());  // Очищаем ошибки/успех
+        if (resultDiv) resultDiv.innerHTML = '';  # Очищаем результаты парсинга
+        document.querySelectorAll('.error, .success, .table').forEach(el => el.remove());  # Очищаем ошибки/успех
     }
 </script>
 </body>
 </html>
 '''
 
+# ИСПРАВЛЕНО: серверный фильтр, форма GET, убрал JS input, добавил submit и reset
 SITES_HTML = '''
 <!DOCTYPE html>
 <html lang="ru">
@@ -1035,20 +1112,10 @@ SITES_HTML = '''
     <h1>Сайты для парсинга <a href="/" style="float:right; font-size:16px;">← Создать новый сайт</a></h1>
     <p>Всего сайтов: {{ sites_count }}</p>
 
-    {% if USE_DB_FOR_RESOURCES %}
     <form class="filter-form" method="get">
-        <input type="text" name="search" placeholder="Фильтр по домену..." value="{{ search }}">
-        <input type="hidden" name="per_page" value="{{ pagination.per_page if pagination else '' }}">
-        <input type="hidden" name="page" value="1">
-        <button type="submit">Фильтровать</button>
-        <button type="button" class="reset-btn" onclick="location.href='?per_page={{ pagination.per_page if pagination else '' }}&page=1'">Сброс</button>
-    </form>
-    {% else %}
-    <div class="filter-form">
-        <input type="text" class="filter-input" placeholder="Фильтр по домену... (на лету)" value="">
+        <input type="text" name="search" placeholder="Фильтр по домену..." value="{{ search }}" id="searchInput">
         <button type="button" class="reset-btn" onclick="resetFilter()">Сброс</button>
-    </div>
-    {% endif %}
+    </form>
 
     <div class="per-page">
         Показывать по:
@@ -1081,7 +1148,7 @@ SITES_HTML = '''
                 <td><code>{{ site.url_selector or '-' }}</code></td>
                 <td>
                     <input type="checkbox" class="checkbox" {{ 'checked' if site.active else '' }}
-                           onchange="toggleCheckbox('{{ site.identifier }}', this.checked, {{ USE_DB_FOR_RESOURCES|lower }})">
+                           onchange="toggleCheckbox('{{ site.identifier }}', this.checked)">
                 </td>
                 <td>
                     <a href="/?edit={{ site.id }}" class="btn btn-edit">Редактировать</a>
@@ -1119,42 +1186,77 @@ SITES_HTML = '''
 </div>
 
 <script>
-function toggleCheckbox(identifier, isActive, isDbMode) {
-    const url = `/sites/toggle?identifier=${encodeURIComponent(identifier)}&active=${isActive}&db=${isDbMode}`;
-    location.href = url;
+let debounceTimer;
+function debounce(func, delay) {
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(func, delay);
 }
 
-function deleteSite(id, name) {
-    if (confirm(`Удалить сайт "${name}" и все его ссылки?`)) {
-        fetch('/sites/delete', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({id: id})
+function updatePage(url) {
+    fetch(url)
+        .then(response => response.text())
+        .then(html => {
+            const temp = document.createElement('div');
+            temp.innerHTML = html;
+            document.querySelector('.container').innerHTML = temp.querySelector('.container').innerHTML;
+            history.pushState(null, '', url);
+            attachEventListeners();
         })
-        .then(() => location.reload());
-    }
+        .catch(err => console.error('Ошибка обновления:', err));
 }
 
-{% if not USE_DB_FOR_RESOURCES %}
-document.querySelector('.filter-input').addEventListener('input', function() {
-    let filter = this.value.toLowerCase();
-    document.querySelectorAll('tbody tr').forEach(row => {
-        let domain = row.querySelector('td:nth-child(2) strong').textContent.toLowerCase();
-        row.style.display = domain.includes(filter) ? '' : 'none';
+function attachEventListeners() {
+    document.querySelectorAll('.pagination a').forEach(link => {
+        link.addEventListener('click', function(e) {
+            e.preventDefault();
+            updatePage(this.href);
+        });
     });
-});
+
+    document.querySelector('#searchInput').addEventListener('input', function() {
+        debounce(() => {
+            const search = this.value;
+            const per_page = new URLSearchParams(window.location.search).get('per_page') || {{ DEFAULT_PER_PAGE }};
+            const url = `/sites?search=${encodeURIComponent(search)}&page=1&per_page=${per_page}`;
+            updatePage(url);
+        }, 300);
+    });
+}
+
+// ==================== ИСПРАВЛЕННЫЙ toggleCheckbox ====================
+function toggleCheckbox(identifier, isActive) {
+    console.log('toggleCheckbox вызван → identifier:', identifier, 'active:', isActive);
+
+    if (!identifier || identifier === 'None' || identifier === '') {
+        console.error('ОШИБКА: identifier пустой или None!');
+        return;
+    }
+
+    const url = `/sites/toggle?identifier=${encodeURIComponent(identifier)}&active=${isActive}`;
+
+    fetch(url, { method: 'GET' })
+        .then(response => {
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            console.log('Toggle успешно отправлен');
+            location.reload();
+        })
+        .catch(err => {
+            console.error('Ошибка при toggle:', err);
+        });
+}
 
 function resetFilter() {
-    const input = document.querySelector('.filter-input');
-    input.value = '';
-    input.dispatchEvent(new Event('input'));
+    const per_page = new URLSearchParams(window.location.search).get('per_page') || {{ DEFAULT_PER_PAGE }};
+    updatePage(`/sites?page=1&per_page=${per_page}`);
 }
-{% endif %}
+
+document.addEventListener('DOMContentLoaded', attachEventListeners);
 </script>
 </body>
 </html>
 '''
 
+# ИСПРАВЛЕНО: серверный фильтр (два), форма GET, чекбокс для is_send, toggle по url, убрал JS applyFilters
 LINKS_HTML = '''
 <!DOCTYPE html>
 <html lang="ru">
@@ -1173,8 +1275,7 @@ LINKS_HTML = '''
         .pagination .active { background: #6c757d; color: white; }
         .per-page { margin: 10px 0; }
         .btn-delete { background: #dc3545; color: white; padding: 6px 12px; border: none; border-radius: 4px; cursor: pointer; }
-        .send-yes { color: green; font-weight: bold; }
-        .send-no { color: orange; }
+        .checkbox { transform: scale(1.3); }
         .title { max-width: 600px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
         .filter-form { margin-bottom: 20px; display: flex; gap: 10px; }
         .filter-form input { padding: 8px; flex-grow: 1; border: 1px solid #ddd; border-radius: 4px; }
@@ -1190,25 +1291,16 @@ LINKS_HTML = '''
     <h1>Список статей <a href="/" style="float:right; font-size:16px;">← Главная</a></h1>
     <p>Всего статей: {{ pagination.total_items }}</p>
 
-    {% if USE_DB_FOR_ARTICLES %}
     <form class="filter-form" method="get">
-        <input type="text" name="search" placeholder="Фильтр по заголовку..." value="{{ search }}">
-        <input type="hidden" name="per_page" value="{{ pagination.per_page }}">
-        <input type="hidden" name="page" value="1">
-        <button type="submit">Фильтровать</button>
-        <button type="button" class="reset-btn" onclick="location.href='?per_page={{ pagination.per_page }}&page=1'">Сброс</button>
-    </form>
-    {% else %}
-    <div class="filter-form">
-        <input type="text" class="filter-input" placeholder="Фильтр по заголовку... (на лету)" value="">
+        <input type="text" name="search_title" placeholder="Фильтр по заголовку..." value="{{ search_title }}" id="searchTitleInput">
+        <input type="text" name="search_site" placeholder="Фильтр по сайту..." value="{{ search_site }}" id="searchSiteInput">
         <button type="button" class="reset-btn" onclick="resetFilter()">Сброс</button>
-    </div>
-    {% endif %}
+    </form>
 
     <div class="per-page">
         Показывать по:
         {% for pp in per_page_options %}
-            <a href="?per_page={{ pp }}&page=1{% if search %}&search={{ search }}{% endif %}" class="{% if pp == pagination.per_page %}active{% endif %}">{{ pp }}</a>
+            <a href="?per_page={{ pp }}&page=1{% if search_title %}&search_title={{ search_title }}{% endif %}{% if search_site %}&search_site={{ search_site }}{% endif %}" class="{% if pp == pagination.per_page %}active{% endif %}">{{ pp }}</a>
         {% endfor %}
     </div>
 
@@ -1232,9 +1324,8 @@ LINKS_HTML = '''
                 </td>
                 <td>{{ link.site_name or '—' }}</td>
                 <td>
-                    <span class="{% if link.is_send %}send-yes{% else %}send-no{% endif %}">
-                        {{ '✅ Да' if link.is_send else '❌ Нет' }}
-                    </span>
+                    <input type="checkbox" class="checkbox" {{ 'checked' if link.is_send else '' }}
+                           onchange="toggleLink('{{ link.url | replace("'", "\\'") }}', this.checked)">
                 </td>
                 <td>{{ link.created_at.strftime('%d %b %y') if link.created_at else '-' }}</td>
                 <td>
@@ -1248,21 +1339,21 @@ LINKS_HTML = '''
     {% if pagination and pagination.total_pages > 1 %}
     <div class="pagination">
         {% if pagination.has_prev %}
-            <a href="?page={{ pagination.page - 1 }}&per_page={{ pagination.per_page }}{% if search %}&search={{ search }}{% endif %}">← Назад</a>
+            <a href="?page={{ pagination.page - 1 }}&per_page={{ pagination.per_page }}{% if search_title %}&search_title={{ search_title }}{% endif %}{% if search_site %}&search_site={{ search_site }}{% endif %}">← Назад</a>
         {% endif %}
 
         {% for p in range(1, pagination.total_pages + 1) %}
             {% if p == pagination.page %}
                 <span class="active">{{ p }}</span>
             {% elif p == 1 or p == pagination.total_pages or (p >= pagination.page - 2 and p <= pagination.page + 2) %}
-                <a href="?page={{ p }}&per_page={{ pagination.per_page }}{% if search %}&search={{ search }}{% endif %}">{{ p }}</a>
+                <a href="?page={{ p }}&per_page={{ pagination.per_page }}{% if search_title %}&search_title={{ search_title }}{% endif %}{% if search_site %}&search_site={{ search_site }}{% endif %}">{{ p }}</a>
             {% elif p == pagination.page - 3 or p == pagination.page + 3 %}
                 <span>...</span>
             {% endif %}
         {% endfor %}
 
         {% if pagination.has_next %}
-            <a href="?page={{ pagination.page + 1 }}&per_page={{ pagination.per_page }}{% if search %}&search={{ search }}{% endif %}">Вперёд →</a>
+            <a href="?page={{ pagination.page + 1 }}&per_page={{ pagination.per_page }}{% if search_title %}&search_title={{ search_title }}{% endif %}{% if search_site %}&search_site={{ search_site }}{% endif %}">Вперёд →</a>
         {% endif %}
     </div>
     {% elif pagination is none %}
@@ -1271,6 +1362,71 @@ LINKS_HTML = '''
 </div>
 
 <script>
+let debounceTimer;
+function debounce(func, delay) {
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(func, delay);
+}
+
+function updatePage(url) {
+    fetch(url)
+        .then(response => response.text())
+        .then(html => {
+            const temp = document.createElement('div');
+            temp.innerHTML = html;
+            document.querySelector('.container').innerHTML = temp.querySelector('.container').innerHTML;
+            history.pushState(null, '', url);
+            attachEventListeners();
+        })
+        .catch(err => console.error('Ошибка обновления:', err));
+}
+
+function attachEventListeners() {
+    document.querySelectorAll('.pagination a').forEach(link => {
+        link.addEventListener('click', function(e) {
+            e.preventDefault();
+            updatePage(this.href);
+        });
+    });
+
+    const titleInput = document.querySelector('#searchTitleInput');
+    const siteInput = document.querySelector('#searchSiteInput');
+
+    titleInput.addEventListener('input', handleInput);
+    siteInput.addEventListener('input', handleInput);
+}
+
+function handleInput() {
+    debounce(() => {
+        const search_title = document.querySelector('#searchTitleInput').value;
+        const search_site = document.querySelector('#searchSiteInput').value;
+        const per_page = new URLSearchParams(window.location.search).get('per_page') || {{ DEFAULT_PER_PAGE }};
+        let url = `/links?page=1&per_page=${per_page}`;
+        if (search_title) url += `&search_title=${encodeURIComponent(search_title)}`;
+        if (search_site) url += `&search_site=${encodeURIComponent(search_site)}`;
+        updatePage(url);
+    }, 300);
+}
+
+function resetFilter() {
+    const per_page = new URLSearchParams(window.location.search).get('per_page') || {{ DEFAULT_PER_PAGE }};
+    updatePage(`/links?page=1&per_page=${per_page}`);
+}
+
+function toggleLink(url, isSend) {
+    fetch(`/links/toggle?url=${encodeURIComponent(url)}&is_send=${isSend}`)
+        .then(response => {
+            if (!response.ok) {
+                throw new Error('Ошибка при обновлении статуса');
+            }
+            location.reload();
+        })
+        .catch(err => {
+            console.error(err);
+            alert('Ошибка: ' + err.message);
+        });
+}
+
 function deleteLink(site_name, url) {
     if (confirm(`Удалить статью с URL "${url}"?`)) {
         fetch('/links/delete', {
@@ -1282,27 +1438,13 @@ function deleteLink(site_name, url) {
     }
 }
 
-{% if not USE_DB_FOR_ARTICLES %}
-document.querySelector('.filter-input').addEventListener('input', function() {
-    let filter = this.value.toLowerCase();
-    document.querySelectorAll('tbody tr').forEach(row => {
-        let title = row.querySelector('.title a').textContent.toLowerCase();
-        row.style.display = title.includes(filter) ? '' : 'none';
-    });
-});
-
-function resetFilter() {
-    const input = document.querySelector('.filter-input');
-    input.value = '';
-    input.dispatchEvent(new Event('input'));
-}
-{% endif %}
+document.addEventListener('DOMContentLoaded', attachEventListeners);
 </script>
 </body>
 </html>
 '''
 
-# Новый маршрут /debug
+# Новый маршрут /debug (без изменений)
 DEBUG_HTML = '''
 <!DOCTYPE html>
 <html lang="ru">
@@ -1422,17 +1564,17 @@ def index():
         last_results = load_last_results()
         links_count = sum(len(articles) for articles in last_results.values())
 
-    site_id = None
+    link_id = None
     if edit_index is not None or parse_now is not None:
         target_id = edit_index if edit_index is not None else parse_now
         all_sites = get_all_sites()
         target_site = next((s for s in all_sites if s['id'] == target_id), None)
 
         if target_site:
-            site_id = target_site['id']
+            link_id = target_site['id']
             resource = {
                 "name": target_site['site_key'],
-                "url": target_site.get('url', f"https://{target_site['site_key']}"),
+                "url": target_site['url'],
                 "item_selector": target_site.get('articles_selector', ''),
                 "title_selector": target_site.get('title_selector', ''),
                 "link_selector": target_site.get('url_selector', ''),
@@ -1457,7 +1599,7 @@ def index():
 
     if request.method == 'POST':
         action = request.form.get('action')
-        site_id_from_form = request.form.get('site_id', type=int)
+        link_id_from_form = request.form.get('link_id', type=int)
 
         current_form = {
             "name": request.form['name'].strip(),
@@ -1469,33 +1611,62 @@ def index():
         }
 
         if action == "save":
-            if USE_DB_FOR_RESOURCES and site_id_from_form:
-                # DB-режим: обновляем существующий сайт
-                try:
-                    with SessionLocal() as session:
-                        session.execute(text("""
-                            UPDATE sites
-                            SET site_key = :site_key,
-                                articles_selector = :articles_selector,
-                                title_selector = :title_selector,
-                                url_selector = :url_selector,
-                                updated_at = NOW()
-                            WHERE id = :id
-                        """), {
-                            "site_key": current_form["name"],
-                            "articles_selector": current_form["item_selector"],
-                            "title_selector": current_form["title_selector"],
-                            "url_selector": current_form["link_selector"],
-                            "id": site_id_from_form
-                        })
-                        session.commit()
-                    success = f"Сайт обновлён: {current_form['name']}"
-                except Exception as e:
-                    error = f"Ошибка обновления в БД: {str(e)}"
+            if USE_DB_FOR_RESOURCES:
+                # Проверка уникальности site_key и site_url
+                with SessionLocal() as session:
+                    existing = session.execute(text("""
+                        SELECT id FROM sites
+                        WHERE (site_key = :site_key OR site_url = :site_url) AND id != :id
+                    """), {"site_key": current_form["name"], "site_url": current_form["url"], "id": link_id_from_form or 0}).scalar()
+                    if existing:
+                        error = "Сайт с таким site_key или site_url уже существует"
+                    else:
+                        domain_name = extract_domain(current_form["url"])
+                        domain_id = find_or_create_domain(domain_name)
+                        if not domain_id:
+                            error = "Ошибка создания домена"
+                        else:
+                            if link_id_from_form:
+                                # Обновление
+                                session.execute(text("""
+                                    UPDATE sites
+                                    SET site_key = :site_key,
+                                        site_url = :site_url,
+                                        articles_selector = :articles_selector,
+                                        title_selector = :title_selector,
+                                        url_selector = :url_selector,
+                                        domain_id = :domain_id,
+                                        updated_at = NOW()
+                                    WHERE id = :id
+                                """), {
+                                    "site_key": current_form["name"],
+                                    "site_url": current_form["url"],
+                                    "articles_selector": current_form["item_selector"],
+                                    "title_selector": current_form["title_selector"],
+                                    "url_selector": current_form["link_selector"],
+                                    "domain_id": domain_id,
+                                    "id": link_id_from_form
+                                })
+                                success = f"Сайт обновлён: {current_form['name']}"
+                            else:
+                                # Новый
+                                session.execute(text("""
+                                    INSERT INTO sites
+                                    (site_key, site_url, articles_selector, title_selector, url_selector, domain_id, active, created_at, updated_at)
+                                    VALUES (:site_key, :site_url, :articles_selector, :title_selector, :url_selector, :domain_id, 0, NOW(), NOW())
+                                """), {
+                                    "site_key": current_form["name"],
+                                    "site_url": current_form["url"],
+                                    "articles_selector": current_form["item_selector"],
+                                    "title_selector": current_form["title_selector"],
+                                    "url_selector": current_form["link_selector"],
+                                    "domain_id": domain_id
+                                })
+                                success = f"Сайт добавлен: {current_form['name']}"
+                            session.commit()
             else:
-                # JSON-режим (или новый сайт)
+                # JSON-режим
                 if edit_index is not None:
-                    # обновление в JSON
                     resources[edit_index - 1] = current_form
                     save_resources(resources)
                     success = f"Обновлён: {current_form['name']}"
@@ -1520,7 +1691,7 @@ def index():
     return render_template_string(HTML,
                                   resource=resource,
                                   edit_index=edit_index,
-                                  site_id=site_id,                    # ← передаём в шаблон
+                                  link_id=link_id,                    # ← передаём в шаблон
                                   error=error,
                                   success=success,
                                   table=table,
@@ -1532,17 +1703,17 @@ def index():
 @app.route('/parse_now', methods=['POST'])
 def parse_now():
     try:
-        site_id = request.form.get('site_id', type=int)
+        link_id = request.form.get('link_id', type=int)
         resource = None
 
-        # Если передан site_id — загружаем существующий ресурс
-        if site_id:
+        # Если передан link_id — загружаем существующий ресурс
+        if link_id:
             all_sites = get_all_sites()
-            target = next((s for s in all_sites if s['id'] == site_id), None)
+            target = next((s for s in all_sites if s['id'] == link_id), None)
             if target:
                 resource = {
                     "name": target['site_key'],
-                    "url": f"https://{target['site_key']}",
+                    "url": target['url'],
                     "item_selector": target.get('articles_selector', ''),
                     "title_selector": target.get('title_selector', ''),
                     "link_selector": target.get('url_selector', ''),
@@ -1580,103 +1751,118 @@ def parse_now():
 
 @app.route('/sites')
 def sites_list():
-    search = request.args.get('search', '').strip().lower()
+    search = request.args.get('search', '').strip()
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', DEFAULT_PER_PAGE, type=int)
+    if per_page not in PER_PAGE_OPTIONS:
+        per_page = DEFAULT_PER_PAGE
 
     if USE_DB_FOR_RESOURCES:
-        # БД-режим с пагинацией и серверным поиском
-        page = request.args.get('page', 1, type=int)
-        per_page = request.args.get('per_page', DEFAULT_PER_PAGE, type=int)
-        if per_page not in PER_PAGE_OPTIONS:
-            per_page = DEFAULT_PER_PAGE
-
+        # ==================== DB режим ====================
         with SessionLocal() as session:
-            if search:
-                total_query = text("SELECT COUNT(*) FROM sites WHERE LOWER(site_key) LIKE :search")
-                total = session.execute(total_query, {"search": f"%{search}%"}).scalar() or 0
-                result_query = text("""
-                    SELECT id, site_key, articles_selector, title_selector, url_selector,
-                           active, created_at
-                    FROM sites
-                    WHERE LOWER(site_key) LIKE :search
-                    ORDER BY created_at DESC
-                    LIMIT :limit OFFSET :offset
-                """)
-            else:
-                total_query = text("SELECT COUNT(*) FROM sites")
-                total = session.execute(total_query).scalar() or 0
-                result_query = text("""
-                    SELECT id, site_key, articles_selector, title_selector, url_selector,
-                           active, created_at
-                    FROM sites
-                    ORDER BY created_at DESC
-                    LIMIT :limit OFFSET :offset
-                """)
+            where_clause = " WHERE site_key LIKE :search" if search else ""
+            params = {"search": f"%{search}%" } if search else {}
+
+            total_query = text(f"SELECT COUNT(*) FROM sites{where_clause}")
+            total = session.execute(total_query, params).scalar() or 0
+
+            # ←←← ИСПРАВЛЕННАЯ СОРТИРОВКА
+            result_query = text(f"""
+                SELECT id, site_key, site_url AS url, articles_selector, title_selector,
+                       url_selector, active, updated_at
+                FROM sites
+                {where_clause}
+                ORDER BY
+                    CASE
+                        WHEN articles_selector IS NULL
+                             OR articles_selector = ''
+                             OR TRIM(articles_selector) = ''
+                        THEN 1
+                        ELSE 0
+                    END,
+                    id DESC
+                LIMIT :limit OFFSET :offset
+            """)
+            params.update({"limit": per_page, "offset": (page - 1) * per_page})
 
             pagination = get_pagination(total, page, per_page)
 
-            result = session.execute(result_query, {"limit": per_page, "offset": pagination['offset'], "search": f"%{search}%"} if search else {"limit": per_page, "offset": pagination['offset']}).fetchall()
+            result = session.execute(result_query, params).mappings().fetchall()
 
-            sites = [dict(row) for row in result]
-            for site in sites:
-                site['url'] = f"https://{site['site_key']}"
+            sites = []
+            for row in result:
+                site_dict = dict(row)
+                site_dict['identifier'] = site_dict['id']
+                sites.append(site_dict)
+
             sites_count = total
+            per_page_options = PER_PAGE_OPTIONS
+
     else:
-        # JSON-режим: загружаем все, сортируем по алфавиту, пагинация отключена, фильтр на клиенте
+        # ==================== JSON режим ====================
         all_sites = get_all_sites()
-        all_sites = sorted(all_sites, key=lambda s: s['site_key'].lower())
-        sites = all_sites
-        pagination = None
-        sites_count = len(sites)
+
+        # Сортировка: сначала с селекторами, потом без + по id DESC
+        def sort_key(site):
+            has_selector = bool(site.get('articles_selector') and
+                               str(site.get('articles_selector')).strip())
+            # True = 0 (сначала), False = 1 (потом)
+            return (0 if has_selector else 1, -site.get('id', 0))   # -id = DESC
+
+        all_sites = sorted(all_sites, key=sort_key)
+
+        filtered = [s for s in all_sites if search.lower() in s['site_key'].lower()]
+        sites_count = len(filtered)
+        pagination = get_pagination(sites_count, page, per_page)
+        start = pagination['offset']
+        sites = filtered[start:start + per_page]
         per_page_options = PER_PAGE_OPTIONS
 
     return render_template_string(SITES_HTML,
-                                      sites=sites,
-                                      pagination=pagination,
-                                      per_page_options=per_page_options,
-                                      sites_count=sites_count,
-                                      NAVIGATION_BAR=get_navigation_bar('sites'),
-                                      USE_DB_FOR_RESOURCES=USE_DB_FOR_RESOURCES,
-                                      search=search)
+                                  sites=sites,
+                                  pagination=pagination,
+                                  per_page_options=per_page_options,
+                                  sites_count=sites_count,
+                                  NAVIGATION_BAR=get_navigation_bar('sites'),
+                                  USE_DB_FOR_RESOURCES=USE_DB_FOR_RESOURCES,
+                                  search=search,
+                                  DEFAULT_PER_PAGE=DEFAULT_PER_PAGE)
 
 @app.route('/sites/toggle')
 def sites_toggle():
-    identifier = request.args.get('identifier')
+    identifier = request.args.get('identifier', '').strip()
     active_str = request.args.get('active', 'true')
-    active = active_str.lower() in ('true', '1', 'on')
-    is_db_mode = request.args.get('db', 'false').lower() == 'true'
+    active = active_str.lower() in ('true', '1', 'on', 'yes')
+
+    logger.info(f"[TOGGLE] Получен запрос: identifier='{identifier}', active={active}")
 
     if not identifier:
+        logger.error("[TOGGLE] ОШИБКА: identifier пустой!")
         return redirect('/sites')
 
-    if is_db_mode:
-        # БД-режим
-        if not SessionLocal:
-            return redirect('/sites')
+    if USE_DB_FOR_RESOURCES:
         try:
             with SessionLocal() as session:
-                session.execute(text("""
+                result = session.execute(text("""
                     UPDATE sites
-                    SET active = :active, updated_at = NOW()
+                    SET active = :active,
+                        updated_at = NOW()
                     WHERE id = :id
                 """), {"active": 1 if active else 0, "id": int(identifier)})
                 session.commit()
-            logger.info(f"DB toggle: site_id={identifier} → active={active}")
+                logger.info(f"[TOGGLE] БД: site_id={identifier} → active={active} (затронуто строк: {result.rowcount})")
         except Exception as e:
-            logger.error(f"Ошибка toggle в БД: {e}")
+            logger.error(f"[TOGGLE] Ошибка в БД: {e}")
     else:
-        # JSON-режим
         resources = load_resources_from_json()
-        updated = False
         for res in resources:
-            if res.get("name") == identifier:
+            if str(res.get("name")) == identifier:
                 res['active'] = active
-                updated = True
+                save_resources_to_json(resources)
+                logger.info(f"[TOGGLE] JSON: '{identifier}' → active={active}")
                 break
-        if updated:
-            save_resources_to_json(resources)
-            logger.info(f"JSON toggle: '{identifier}' → active={active}")
         else:
-            logger.warning(f"JSON: ресурс '{identifier}' не найден")
+            logger.warning(f"[TOGGLE] JSON: ресурс '{identifier}' не найден")
 
     return redirect('/sites')
 
@@ -1704,54 +1890,59 @@ def delete_site():
 
 @app.route('/links')
 def links_list():
-    search = request.args.get('search', '').strip().lower()
+    search_title = request.args.get('search_title', '').strip()  # ИСПРАВЛЕНО: серверный поиск (два)
+    search_site = request.args.get('search_site', '').strip()
     page = request.args.get('page', 1, type=int)
     per_page = request.args.get('per_page', DEFAULT_PER_PAGE, type=int)
     if per_page not in PER_PAGE_OPTIONS:
         per_page = DEFAULT_PER_PAGE
 
     if USE_DB_FOR_ARTICLES:
-        # БД-режим с пагинацией и серверным поиском
         with SessionLocal() as session:
-            if search:
-                total_query = text("SELECT COUNT(*) FROM links WHERE LOWER(title) LIKE :search")
-                total = session.execute(total_query, {"search": f"%{search}%"}).scalar() or 0
-                result_query = text("""
-                    SELECT l.id, l.title, l.url, l.is_send, l.created_at,
-                           COALESCE(s.site_key, '—') as site_name
-                    FROM links l
-                    LEFT JOIN sites s ON l.site_id = s.id
-                    WHERE LOWER(l.title) LIKE :search
-                    ORDER BY l.created_at DESC
-                    LIMIT :limit OFFSET :offset
-                """)
-            else:
-                total_query = text("SELECT COUNT(*) FROM links")
-                total = session.execute(total_query).scalar() or 0
-                result_query = text("""
-                    SELECT l.id, l.title, l.url, l.is_send, l.created_at,
-                           COALESCE(s.site_key, '—') as site_name
-                    FROM links l
-                    LEFT JOIN sites s ON l.site_id = s.id
-                    ORDER BY l.created_at DESC
-                    LIMIT :limit OFFSET :offset
-                """)
+            where_clause = ""
+            params = {}
+            if search_title or search_site:
+                where_clause = " WHERE "
+                if search_title:
+                    where_clause += "l.title LIKE :search_title "
+                    params["search_title"] = f"%{search_title}%"
+                if search_title and search_site:
+                    where_clause += "AND "
+                if search_site:
+                    where_clause += "COALESCE(d.name, '') LIKE :search_site "
+                    params["search_site"] = f"%{search_site}%"
+
+            total_query = text(f"SELECT COUNT(*) FROM links l LEFT JOIN domains d ON l.domain_id = d.id{where_clause}")
+            total = session.execute(total_query, params).scalar() or 0
+
+            result_query = text(f"""
+                SELECT l.id, l.title, l.url, l.is_send, l.created_at,
+                       COALESCE(d.name, '—') as site_name
+                FROM links l
+                LEFT JOIN domains d ON l.domain_id = d.id
+                {where_clause}
+                ORDER BY l.id DESC
+                LIMIT :limit OFFSET :offset
+            """)
+            params.update({"limit": per_page, "offset": (page - 1) * per_page})
 
             pagination = get_pagination(total, page, per_page)
             links_count = total
 
-            result = session.execute(result_query, {"limit": per_page, "offset": pagination['offset'], "search": f"%{search}%"} if search else {"limit": per_page, "offset": pagination['offset']}).fetchall()
+            result = session.execute(result_query, params).mappings().fetchall()
 
             links = [dict(row) for row in result]
+            logger.info(f"Для /links: загружено {len(links)} на странице {page}")
             per_page_options = PER_PAGE_OPTIONS
     else:
-        # JSON-режим
+        # JSON-режим: фильтр на сервере
         all_links = get_all_links()
-        all_links.sort(key=lambda l: l['created_at'] or datetime.min, reverse=True)
-        links_count = len(all_links)
+        all_links.sort(key=lambda l: l['id'], reverse=True)
+        filtered = [l for l in all_links if search_title.lower() in l['title'].lower() and search_site.lower() in (l['site_name'] or '').lower()]
+        links_count = len(filtered)
         pagination = get_pagination(links_count, page, per_page)
         start = pagination['offset']
-        links = all_links[start:start + per_page]          # ← исправлено
+        links = filtered[start:start + per_page]
         per_page_options = PER_PAGE_OPTIONS
 
     return render_template_string(LINKS_HTML,
@@ -1761,7 +1952,54 @@ def links_list():
                                   links_count=links_count,
                                   NAVIGATION_BAR=get_navigation_bar('links'),
                                   USE_DB_FOR_ARTICLES=USE_DB_FOR_ARTICLES,
-                                  search=search)
+                                  search_title=search_title,
+                                  search_site=search_site,
+                                  DEFAULT_PER_PAGE=DEFAULT_PER_PAGE)
+
+@app.route('/links/toggle')  # НОВОЕ: toggle is_send по url (для обоих режимов)
+def links_toggle():
+    url = request.args.get('url')
+    is_send_str = request.args.get('is_send', 'true')
+    is_send = is_send_str.lower() in ('true', '1', 'on')
+
+    if not url:
+        return "No url", 400
+
+    if USE_DB_FOR_ARTICLES:
+        if not SessionLocal:
+            return "DB not configured", 500
+        try:
+            with SessionLocal() as session:
+                session.execute(text("""
+                    UPDATE links
+                    SET is_send = :is_send, updated_at = NOW()
+                    WHERE url = :url
+                """), {"is_send": 1 if is_send else 0, "url": url})
+                session.commit()
+            logger.info(f"DB toggle is_send: url={url} → {is_send}")
+        except Exception as e:
+            logger.error(f"Ошибка toggle is_send в БД: {e}")
+            return f"Error: {str(e)}", 500
+    else:
+        # JSON-режим
+        last_results = load_last_results()
+        updated = False
+        for site_articles in last_results.values():
+            for art in site_articles:
+                if art.get('url') == url:
+                    art['is_send'] = is_send
+                    updated = True
+                    break
+            if updated:
+                break
+        if updated:
+            save_last_results(last_results)
+            logger.info(f"JSON toggle is_send: url={url} → {is_send}")
+        else:
+            logger.warning(f"JSON: статья с url={url} не найдена")
+            return "Article not found", 404
+
+    return redirect('/links')
 
 @app.route('/links/delete', methods=['POST'])
 def delete_link():
