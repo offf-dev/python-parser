@@ -91,6 +91,7 @@ TELEGRAM_TOKEN_LOGS = os.getenv("TG_BOT_TOKEN_FOR_LOGS")
 TELEGRAM_CHANNEL_ID_LOGS = int(os.getenv("TG_CHAT_ID_FOR_LOGS"))
 
 PARSER_INTERVAL_MINUTES = int(os.getenv("PARSER_INTERVAL_MINUTES", 10))
+SENDER_INTERVAL_MINUTES = int(os.getenv("SENDER_INTERVAL_MINUTES", 10))
 
 DATA_FILE = 'data/resources.json'
 LAST_RESULTS_FILE = 'data/last_results.json'
@@ -110,6 +111,12 @@ DB_DATABASE = os.getenv("DB_DATABASE")
 DB_USERNAME = os.getenv("DB_USERNAME")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
 DB_USE_SSL = os.getenv("DB_USE_SSL", "false").lower() == "true"
+
+# Lock для отправки
+send_lock = asyncio.Lock()
+
+# Lock для парсинга
+parse_lock = asyncio.Lock()
 
 # Lock для файлов
 file_lock = threading.Lock()
@@ -650,7 +657,10 @@ async def send_new_articles_async():
             res_start_time = time.perf_counter()  # Начало измерения для ресурса
 
             try:
-                current_items, error_msg = await parse_resource(resource, limit=20)
+                async with parse_lock:
+                    logger.info(f"🔒 Автопарсинг: захват lock для {name}")
+                    current_items, error_msg = await parse_resource(resource, limit=20)
+                    logger.info(f"🔓 Автопарсинг: освобождён lock для {name}")
             except Exception as parse_e:
                 error_msg = f"Неожиданная ошибка парсинга {name}: {str(parse_e)}"
                 logger.error(error_msg)
@@ -733,6 +743,62 @@ async def run_auto_parse():
         logger.error(error_msg)
         await send_error_to_telegram(error_msg)
 
+# ====================== ОТПРАВКА НЕОТПРАВЛЕННОЙ СТАТЬИ ======================
+async def send_oldest_unsent_article():
+    """Отправляет в Telegram самую старую статью с is_send=0 и помечает как отправленную"""
+    if not USE_DB_FOR_ARTICLES or not SessionLocal:
+        logger.warning("Отправка старых статей отключена (JSON-режим или БД не настроена)")
+        return
+
+    async with send_lock:
+        try:
+            with SessionLocal() as session:
+                # Находим САМУЮ СТАРУЮ неотправленную статью
+                article = session.execute(text("""
+                    SELECT id, title, url, created_at, site_id
+                    FROM links
+                    WHERE is_send = 0
+                    ORDER BY created_at ASC, id ASC   # самая старая + по id на всякий
+                    LIMIT 1
+                """)).mappings().first()
+
+                if not article:
+                    logger.info("✅ Нет неотправленных статей для отправки")
+                    return
+
+                # Формируем красивое сообщение (как в парсере)
+                message = f"""
+<b>📌 Старая статья (отложенная отправка)</b>
+
+<a href="{article['url']}">{article['title']}</a>
+
+<i>Добавлена: {article['created_at'].strftime('%d.%m.%Y %H:%M')}</i>
+"""
+
+                # Отправляем
+                await articles_bot.send_message(
+                    chat_id=TELEGRAM_CHANNEL_ID_ARTICLES,
+                    text=message.strip(),
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True
+                )
+
+                # Помечаем как отправленную
+                session.execute(text("""
+                    UPDATE links
+                    SET is_send = 1,
+                        updated_at = NOW()
+                    WHERE id = :id
+                """), {"id": article['id']})
+                session.commit()
+
+                logger.info(f"✅ Отправлена старая статья: {article['title'][:80]}...")
+
+        except Exception as e:
+            error_msg = f"Ошибка отправки старой статьи: {e}"
+            logger.error(error_msg)
+            await send_error_to_telegram(error_msg)
+
 # ====================== ПЛАНИРОВЩИК ======================
 scheduler = AsyncIOScheduler()
 
@@ -755,14 +821,25 @@ scheduler.add_job(
     coalesce=True
 )
 
+scheduler.add_job(
+    send_oldest_unsent_article,
+    trigger='interval',
+    minutes=SENDER_INTERVAL_MINUTES,
+    next_run_time=datetime.now() + timedelta(seconds=45),  # чуть позже парсера
+    id='send_oldest_article_job',
+    max_instances=1,
+    coalesce=True
+)
+
 # ====================== СТАРТОВОЕ СООБЩЕНИЕ ======================
 async def send_startup_message():
     await send_telegram_message(
         "<b>Парсер запущен!</b>\n\n"
-        "Первое сообщение — через 30 секунд\n"
-        f"Далее — каждые {PARSER_INTERVAL_MINUTES} минут ✅"
+        f"• Парсинг новых статей — каждые {PARSER_INTERVAL_MINUTES} мин\n"
+        f"• Отправка старых статей — каждые {SENDER_INTERVAL_MINUTES} мин ✅\n\n"
+        "Первое сообщение — через 30 секунд"
     )
-    logger.info("Стартовое сообщение отправлено")
+    logger.info(f"Стартовое сообщение отправлено (парсер: {PARSER_INTERVAL_MINUTES}м, отправка: {SENDER_INTERVAL_MINUTES}м)")
 
 # ====================== ASGI + Hypercorn ======================
 from hypercorn.config import Config
@@ -920,7 +997,6 @@ def get_pagination(total_items, page, per_page):
 # ==================== HTML + РОУТ ====================
 def get_navigation_bar(current_page=''):
     """Возвращает готовую HTML-навигацию с подставленными значениями"""
-    db_type = 'MySQL' if DB_HOST and 'mysql' in DB_HOST.lower() else 'JSON'
     resources_mode = 'DB' if USE_DB_FOR_RESOURCES else 'JSON'
     articles_mode = 'DB' if USE_DB_FOR_ARTICLES else 'JSON'
 
@@ -935,7 +1011,7 @@ def get_navigation_bar(current_page=''):
         </div>
 
         <div style="margin-left: auto; color: #adb5bd; font-size: 13px;">
-            DB: {db_type} | Resources: {resources_mode} | Articles: {articles_mode}
+            Resources: {resources_mode} | Articles: {articles_mode}
         </div>
     </div>
 </nav>
@@ -1014,10 +1090,7 @@ HTML = '''
 </div>
 
 <script>
-    function parseSaved(i) { location.href = '/?load=' + i; }
-    function editResource(i) { location.href = '/?edit=' + i; }
-    function deleteResource(i) { if(confirm('Удалить?')) location.href = '/?delete=' + i; }
-
+    // ==================== УЛУЧШЕННЫЙ ПАРСИНГ НА ГЛАВНОЙ ====================
     document.getElementById('parseBtn').addEventListener('click', async function(e) {
         e.preventDefault();
 
@@ -1026,9 +1099,12 @@ HTML = '''
         const loading = document.getElementById('loading');
         const resultDiv = document.getElementById('parseResult');
 
-        // Отключаем кнопку
+        // === ВИЗУАЛЬНЫЙ ФИДБЕК ===
+        const originalText = btn.textContent;
         btn.disabled = true;
         btn.textContent = 'Парсинг...';
+        btn.style.backgroundColor = '#6c757d';  // серый цвет
+        btn.style.cursor = 'not-allowed';
         loading.style.display = 'block';
         resultDiv.innerHTML = '';
 
@@ -1044,29 +1120,33 @@ HTML = '''
 
             if (result.success) {
                 resultDiv.innerHTML = `
+                    <div class="success">Успешно спаршено ${result.count} статей с ${result.resource_name || 'ресурса'}!</div>
                     <h3>Результат парсинга (${result.count} статей)</h3>
                     ${result.table}
                 `;
                 resultDiv.scrollIntoView({ behavior: 'smooth', block: 'start' });
             } else {
-                resultDiv.innerHTML = `<div class="error">${result.error}</div>`;
+                resultDiv.innerHTML = `<div class="error">${result.error || 'Неизвестная ошибка'}</div>`;
             }
 
         } catch (err) {
             resultDiv.innerHTML = `<div class="error">Ошибка соединения: ${err.message}</div>`;
         } finally {
-            // Возвращаем кнопку
+            // === ВОЗВРАЩАЕМ ВСЁ В ИСХОДНОЕ СОСТОЯНИЕ ===
             btn.disabled = false;
-            btn.textContent = 'Парсить сейчас';
+            btn.textContent = originalText;
+            btn.style.backgroundColor = '';
+            btn.style.cursor = 'pointer';
             loading.style.display = 'none';
         }
     });
 
+    // Очистка формы (как было)
     function clearAll() {
         document.getElementById('parseForm').reset();
         const resultDiv = document.getElementById('parseResult');
-        if (resultDiv) resultDiv.innerHTML = '';  # Очищаем результаты парсинга
-        document.querySelectorAll('.error, .success, .table').forEach(el => el.remove());  # Очищаем ошибки/успех
+        if (resultDiv) resultDiv.innerHTML = '';
+        document.querySelectorAll('.error, .success, .table').forEach(el => el.remove());
     }
 </script>
 </body>
@@ -1701,7 +1781,7 @@ def index():
                                   links_count=links_count)
 
 @app.route('/parse_now', methods=['POST'])
-def parse_now():
+async def parse_now():  # ←←← async def
     try:
         link_id = request.form.get('link_id', type=int)
         resource = None
@@ -1729,7 +1809,11 @@ def parse_now():
                 "link_selector": request.form['link_selector'].strip(),
             }
 
-        data, parse_error = asyncio.run(parse_resource(resource, limit=20))
+        # ←←← ЗАЩИТА ОТ ПАРАЛЛЕЛЬНОГО ПАРСИНГА
+        async with parse_lock:
+            logger.info(f"🔒 Захвачен lock для ручного парсинга: {resource['name']}")
+            data, parse_error = await parse_resource(resource, limit=20)  # ← await вместо asyncio.run
+            logger.info(f"🔓 Освобождён lock для ручного парсинга")
 
         if parse_error:
             return {"success": False, "error": parse_error}
@@ -1747,6 +1831,7 @@ def parse_now():
         }
 
     except Exception as e:
+        logger.error(f"Ошибка в /parse_now: {e}")
         return {"success": False, "error": str(e)}
 
 @app.route('/sites')
