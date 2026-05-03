@@ -147,7 +147,12 @@ def extract_articles(html: str, item_selector: str, title_selector: str,
                 link_raw = a["href"] if a else None
         else:
             link_tag = item.select_one(link_selector)
-            link_raw = link_tag.get("href") if (link_tag and link_tag.has_attr("href")) else None
+            if link_tag is not None:
+                # Fallback на data-href для сайтов вроде Medium, где URL живёт
+                # на <div data-href="..."> вместо <a href="...">.
+                link_raw = link_tag.get("href") or link_tag.get("data-href")
+            else:
+                link_raw = None
 
         if not link_raw:
             continue
