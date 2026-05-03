@@ -1,0 +1,79 @@
+{% extends "base.html" %}
+{% block title %}Сайты — Парсер{% endblock %}
+{% block content %}
+<h1>Сайты для парсинга <a href="/" class="container__title-link">← Создать новый сайт</a></h1>
+<p>Всего сайтов: {{ sites_count }}</p>
+
+<form class="filter-form" method="get">
+    <input type="text" name="search" placeholder="Фильтр по домену..." value="{{ search }}" id="searchInput">
+    <button type="button" onclick="resetFilter()">Сброс</button>
+</form>
+
+<div class="per-page">
+    Показывать по:
+    {% for pp in per_page_options %}
+        <a href="?per_page={{ pp }}&page=1{% if search %}&search={{ search }}{% endif %}" class="{% if pp == pagination.per_page %}active{% endif %}">{{ pp }}</a>
+    {% endfor %}
+</div>
+
+<table>
+    <thead>
+        <tr>
+            <th>ID</th>
+            <th>Домен</th>
+            <th>URL</th>
+            <th>Articles selector</th>
+            <th>Title selector</th>
+            <th>URL selector</th>
+            <th>Active</th>
+            <th>Действия</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for site in sites %}
+        <tr>
+            <td>{{ site.id }}</td>
+            <td><strong>{{ site.site_key }}</strong></td>
+            <td><a href="{{ site.url }}" target="_blank" rel="noopener">{{ site.url }}</a></td>
+            <td><code>{{ site.articles_selector or '-' }}</code></td>
+            <td><code>{{ site.title_selector or '-' }}</code></td>
+            <td><code>{{ site.url_selector or '-' }}</code></td>
+            <td>
+                <input type="checkbox" class="checkbox" {{ 'checked' if site.active else '' }}
+                       onchange="toggleCheckbox('{{ site.identifier }}', this.checked)">
+            </td>
+            <td>
+                <a href="/?edit={{ site.id }}" class="btn btn-edit">Редактировать</a>
+                <a href="/?parse_now={{ site.id }}" class="btn btn-parse">Спарсить</a>
+                <button onclick="deleteSite({{ site.id }}, '{{ site.site_key }}')" class="btn btn-delete">Удалить</button>
+            </td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+
+{% if pagination and pagination.total_pages > 1 %}
+<div class="pagination">
+    {% if pagination.has_prev %}
+        <a href="?page={{ pagination.page - 1 }}&per_page={{ pagination.per_page }}{% if search %}&search={{ search }}{% endif %}">← Назад</a>
+    {% endif %}
+    {% for p in range(1, pagination.total_pages + 1) %}
+        {% if p == pagination.page %}
+            <span class="active">{{ p }}</span>
+        {% elif p == 1 or p == pagination.total_pages or (p >= pagination.page - 2 and p <= pagination.page + 2) %}
+            <a href="?page={{ p }}&per_page={{ pagination.per_page }}{% if search %}&search={{ search }}{% endif %}">{{ p }}</a>
+        {% elif p == pagination.page - 3 or p == pagination.page + 3 %}
+            <span>...</span>
+        {% endif %}
+    {% endfor %}
+    {% if pagination.has_next %}
+        <a href="?page={{ pagination.page + 1 }}&per_page={{ pagination.per_page }}{% if search %}&search={{ search }}{% endif %}">Вперёд →</a>
+    {% endif %}
+</div>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script>const DEFAULT_PER_PAGE = {{ default_per_page }};</script>
+<script src="{{ url_for('static', filename='js/sites.js') }}"></script>
+{% endblock %}

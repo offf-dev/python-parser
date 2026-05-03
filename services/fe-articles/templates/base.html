@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>{% block title %}Парсер статей{% endblock %}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    {% block head_extra %}{% endblock %}
+</head>
+<body>
+
+<nav class="topbar">
+    <div class="topbar__inner">
+        <div class="topbar__links">
+            <a href="/" class="topbar__link {% if current_page == 'main' %}topbar__link--active{% endif %}">Main</a>
+            <a href="/sites" class="topbar__link {% if current_page == 'sites' %}topbar__link--active{% endif %}">Resources</a>
+            <a href="/links" class="topbar__link {% if current_page == 'links' %}topbar__link--active{% endif %}">Articles</a>
+            <a href="/debug" class="topbar__link {% if current_page == 'debug' %}topbar__link--active{% endif %}">Debug HTML</a>
+        </div>
+        <div class="topbar__mode">
+            Resources: {{ resources_mode }} | Articles: {{ articles_mode }}
+        </div>
+    </div>
+</nav>
+
+<main class="container">
+    {% block content %}{% endblock %}
+</main>
+
+{% block scripts %}{% endblock %}
+</body>
+</html>

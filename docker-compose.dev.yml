@@ -1,0 +1,27 @@
+# Dev override: docker compose -f docker-compose.yml -f docker-compose.dev.yml up fe-articles
+#
+# - Bind-mount исходников: правки на хосте сразу видно в контейнере
+# - Flask debug-сервер с auto-reload: код и шаблоны перечитываются без рестарта
+# - DB-режим включён, но READONLY_DB=true: читаем sites/links/blocked_keywords из MySQL,
+#   ничего не пишем. Новые статьи preview-публикуются в TG-канал вместо сохранения.
+# - Telegram-токены подсасываются из .env, не зануляются.
+# - Scheduler в Flask dev режиме не работает (нужен Hypercorn). Для теста полного
+#   цикла парсинга:
+#       docker exec python-parser-fe-articles-1 python run_once.py
+
+services:
+  fe-articles:
+    volumes:
+      - ./services/fe-articles:/app
+      - /app/__pycache__
+    environment:
+      APP_ENV: development
+      ENABLE_RELOADER: "true"
+      ENABLE_SCHEDULER: "false"
+      USE_DB_FOR_RESOURCES: "true"
+      USE_DB_FOR_ARTICLES: "true"
+      READONLY_DB: "true"
+      # TG_BOT_TOKEN_FOR_* и TG_CHAT_ID_FOR_* — из .env, не override
+
+  number-challenge:
+    profiles: ["with-nc"]

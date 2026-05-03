@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}Debug HTML — Парсер{% endblock %}
+{% block content %}
+<h1>Debug: получить HTML страницы</h1>
+
+<form id="debugForm" method="post" class="form">
+    <input type="text" name="url" placeholder="URL страницы" value="{{ url if url else '' }}" required>
+    <label class="inline">
+        <input type="checkbox" name="clean_assets" {{ 'checked' if clean_assets else '' }}>
+        Удалить ассеты (скрипты, стили, meta и т.д.)
+    </label>
+    <button type="submit" id="getHtmlBtn" class="btn-green">Получить HTML</button>
+</form>
+
+<div id="loading" class="loading" style="display:none;">⏳ Загрузка HTML... Пожалуйста, подождите</div>
+<div id="debugResult"></div>
+
+{% if error %}<div class="alert alert-error">{{ error }}</div>{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/debug.js') }}"></script>
+{% endblock %}

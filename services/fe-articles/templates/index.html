@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% block title %}Парсер статей — Главная{% endblock %}
+{% block content %}
+<h1>Создать / Редактировать сайт для парсинга</h1>
+
+<div class="links-row">
+    <a href="/sites">→ Все сайты ({{ sites_count }})</a>
+    <a href="/links">→ Все статьи ({{ links_count }})</a>
+</div>
+
+<h2>{% if edit_index is defined %}Редактировать ресурс{% else %}Новый ресурс{% endif %}</h2>
+
+<form id="parseForm" method="post" class="form">
+    {% if link_id %}
+        <input type="hidden" name="link_id" value="{{ link_id }}">
+    {% endif %}
+    {% if edit_index is defined %}
+        <input type="hidden" name="edit_index" value="{{ edit_index }}">
+    {% endif %}
+    <input type="text" name="name" placeholder="Название ресурса (например: smashingmagazine.com)" value="{{ resource.name if resource else '' }}" required>
+    <input type="text" name="url" placeholder="URL страницы со списком статей (https://...)" value="{{ resource.url if resource else '' }}" required>
+    <input type="text" name="item_selector" placeholder="Селектор блока статьи (например: .article)" value="{{ resource.item_selector if resource else '' }}" required>
+    <input type="text" name="title_selector" placeholder="Селектор заголовка внутри блока" value="{{ resource.title_selector if resource else '' }}" required>
+    <input type="text" name="link_selector" placeholder="Селектор ссылки внутри блока" value="{{ resource.link_selector if resource else '' }}" required>
+
+    <div class="btn-group">
+        <button type="submit" name="action" value="parse" class="btn-green" id="parseBtn">Parse resource</button>
+        <button type="submit" name="action" value="save">Save resource</button>
+        <button type="button" class="btn-grey" onclick="clearAll()">Clear all</button>
+    </div>
+</form>
+
+<div id="loading" class="loading" style="display:none;">⏳ Парсинг страницы... Пожалуйста, подождите</div>
+<div id="parseResult"></div>
+
+{% if error %}<div class="alert alert-error">{{ error }}</div>{% endif %}
+{% if success %}<div class="alert alert-success">{{ success }}</div>{% endif %}
+
+{% if table %}
+<div class="table-result">
+    <h3>Результат парсинга ({{ count }} статей)</h3>
+    {{ table|safe }}
+</div>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/main.js') }}"></script>
+{% endblock %}
