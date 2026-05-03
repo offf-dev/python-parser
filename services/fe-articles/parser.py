@@ -284,7 +284,8 @@ async def run_auto_parse():
                             bot.format_article(it["title"], it["url"], res.get("emoji"))
                         )
 
-        # Bulk-summary в logs-чат, не в публичный канал (per docs/parser.md §5)
+        # Bulk-summary в articles-канал — это операционная сводка прогона
+        # парсера для аудитории канала, не ошибка. logs-чат только для алертов.
         message = "🔥 Обновление парсинга\n\n" + "\n".join(lines) if lines else "Ничего не спарсили 😔"
         if errors:
             message += "\n\n⚠️ Проблемы при парсинге:\n" + "\n".join(errors)
@@ -293,7 +294,7 @@ async def run_auto_parse():
                 message += f"\n\n🧪 READONLY: новых {len(all_new)} (preview уже улетел в articles)"
             else:
                 message += f"\n\nНовых статей: {len(all_new)} (уйдут в канал по trickle-расписанию)"
-        await bot.send_log(message)
+        await bot.send_articles(message, preview=False)
 
         elapsed = time.perf_counter() - start
         logger.info(

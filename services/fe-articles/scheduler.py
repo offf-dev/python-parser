@@ -108,9 +108,10 @@ def configure_jobs():
 
 
 async def send_startup_message():
-    await bot.send_log(
+    await bot.send_articles(
         "<b>Парсер запущен</b>\n\n"
         f"• Парсинг — каждые {config.PARSER_INTERVAL_MINUTES} мин\n"
         f"• Trickle-отправка — каждые {config.SENDER_INTERVAL_MINUTES} мин\n\n"
-        "Первый парсинг через 30 секунд."
+        "Первый парсинг через 30 секунд.",
+        preview=False,
     )
