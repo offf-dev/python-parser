@@ -8,6 +8,7 @@ import asyncio
 import atexit
 import traceback
 
+from asgiref.wsgi import WsgiToAsgi
 from flask import Flask
 from hypercorn.asyncio import serve
 from hypercorn.config import Config
@@ -61,10 +62,14 @@ async def _main_prod():
         cfg.bind = [f"0.0.0.0:{config.PORT}"]
         cfg.use_reloader = False
         cfg.worker_class = "asyncio"
+        # Flask — это WSGI; встроенный Hypercorn-WSGI-мост падает с
+        # UnexpectedMessageError на завершении ответа. asgiref.WsgiToAsgi
+        # делает то же самое, но без бага.
+        asgi_app = WsgiToAsgi(app)
         logger.info("Запуск Hypercorn + scheduler...")
         await asyncio.gather(
             _run_scheduler_and_bots(),
-            serve(app, cfg),
+            serve(asgi_app, cfg),
         )
     except Exception as e:
         msg = f"Критическая ошибка в _main_prod: {e}\n{traceback.format_exc()}"

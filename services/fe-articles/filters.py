@@ -40,35 +40,31 @@ def _strip_for_ascii_check(title: str) -> str:
     return cleaned.strip()
 
 
-# Языки, на которых langdetect срабатывает УВЕРЕННО при реальном не-английском
-# тексте. Если top-1 равен любому из этого списка — это не английский, точка.
-# (Список — пересечение основных мировых + европейских + соседей.)
-_RELIABLY_NON_EN = frozenset({
-    "fr", "es", "pt", "it", "ca", "de", "nl", "ro", "pl", "cs", "sk", "hu",
-    "ru", "uk", "be", "bg", "mk", "sr", "hr", "sl",
-    "el", "tr", "ar", "fa", "he", "hi", "ur", "bn", "ta", "te",
-    "ja", "zh-cn", "zh-tw", "ko", "vi", "th", "ms",
-    "fi", "et", "lv", "lt",
+# Языки с не-латинской письменностью — langdetect определяет их надёжно,
+# и ASCII-фоллбэк на них всё равно не сработал бы. Жёстко режем, минуя fallback.
+# (Belt-and-suspenders: ASCII-проверка их и так отсекла бы, но явное лучше неявного.)
+_NON_LATIN_LANGS = frozenset({
+    "ru", "uk", "be", "bg", "mk", "sr", "ka",          # кириллица + грузинский
+    "ja", "zh-cn", "zh-tw", "ko",                       # CJK
+    "ar", "fa", "he", "ur",                             # арабский / иврит / фарси / урду
+    "hi", "bn", "ta", "te", "gu", "kn", "ml", "pa",     # индийские
+    "mr", "ne", "si",                                   # маратхи / непальский / синхала
+    "th", "lo", "my", "km",                             # ЮВ Азия
+    "el",                                               # греческий
+    "am", "ti",                                         # эфиопские
 })
-
-# А вот эти labels langdetect выдаёт ЛОЖНО для коротких/технических английских
-# заголовков (типа 'CSS Grid is awesome' → 'af'). Для них применяем ASCII-фоллбэк
-# вместо строгой блокировки. (Это явно не основные источники не-английских постов
-# в frontend-блогах.)
-# Не перечисляем — просто всё, что не 'en' и не в _RELIABLY_NON_EN, считаем
-# «спорным» и отдаём в ASCII-проверку.
 
 
 def is_english(title: str) -> bool:
-    """Строгий режим: блокирует уверенно определённые не-английские языки.
+    """По правилам docs/parser.md §4.2:
+       'en' в top-3 langdetect ИЛИ pure-ASCII (после эмодзи).
 
-    **Отступление** от docs/parser.md §4.2 (там было мягче — top-3 ИЛИ pure-ASCII).
-    Логика:
-      1) Эмодзи и спец-символы стрипаем перед детекцией (мешают langdetect).
-      2) langdetect → top-1 == 'en' → pass.
-      3) top-1 ∈ {fr, es, de, ru, ja, …} (известные надёжные не-en детекции) → reject.
-      4) Иначе (langdetect выдал 'af'/'id'/'so' для технического английского,
-         либо вообще упал на короткой строке) → pure-ASCII fallback.
+    Дополнение: если top-1 — язык с не-латинской письменностью, режем сразу
+    (это окно эффективности docs-правила всё равно ловило через ASCII, теперь явно).
+
+    Trade-off: пропускает французский/испанский/немецкий (они на латинице).
+    На наших frontend-фидах это редкость — основной не-английский шум приходит
+    из CJK/кириллицы, что мы режем.
     """
     if not title:
         return False
@@ -83,19 +79,18 @@ def is_english(title: str) -> bool:
         DetectorFactory.seed = 0
         try:
             scores = detect_langs(detect_input)
-            top_lang = scores[0].lang if scores else None
-            if top_lang == "en":
-                return True
-            if top_lang in _RELIABLY_NON_EN:
+            if scores and scores[0].lang in _NON_LATIN_LANGS:
                 return False
-            # Спорное определение — ASCII-фоллбэк
-            return detect_input.isascii()
+            top3 = [s.lang for s in scores[:3]]
+            if "en" in top3:
+                return True
         except Exception:
-            # Слишком короткое для детектора — ASCII-фоллбэк
-            return detect_input.isascii()
+            pass  # короткая/смешанная — переходим к ASCII
     except ImportError:
-        cleaned = _strip_for_ascii_check(title)
-        return bool(cleaned) and cleaned.isascii()
+        pass
+
+    cleaned = _strip_for_ascii_check(title)
+    return bool(cleaned) and cleaned.isascii()
 
 
 def has_long_number(title: str) -> bool:
