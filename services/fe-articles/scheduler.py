@@ -91,6 +91,17 @@ async def send_oldest_unsent_article():
             await bot.send_log(f"Ошибка отправки старой статьи: {e}")
 
 
+async def _daily_prune():
+    n = storage.prune_old_links()
+    if n > 0:
+        logger.info(f"Daily prune: deleted {n} old links (>{config.LINKS_RETENTION_DAYS}d, is_send=1)")
+        if n >= 100:
+            await bot.send_log(
+                f"🧹 Daily prune: удалено <b>{n}</b> старых записей из links "
+                f"(старше {config.LINKS_RETENTION_DAYS} дней, is_send=1)"
+            )
+
+
 def configure_jobs():
     """Регистрирует jobs — вызвать ОДИН раз перед scheduler.start()."""
     scheduler.add_job(
@@ -105,6 +116,12 @@ def configure_jobs():
         next_run_time=datetime.now() + timedelta(seconds=45),
         id="send_oldest_article_job", max_instances=1, coalesce=True,
     )
+    if config.LINKS_RETENTION_DAYS > 0:
+        scheduler.add_job(
+            _daily_prune, trigger="cron",
+            hour=4, minute=0,
+            id="prune_old_links_job", max_instances=1, coalesce=True,
+        )
 
 
 async def send_startup_message():

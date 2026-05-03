@@ -37,8 +37,12 @@
     <div class="emoji-modal__backdrop" onclick="closeEmojiModal()"></div>
     <div class="emoji-modal__card">
         <h3>Выбери эмодзи для источника</h3>
-        <p class="emoji-modal__hint">Будет использоваться перед заголовком статьи в Telegram.</p>
+        <p class="emoji-modal__hint">Будет использоваться перед заголовком статьи в Telegram. Если в наборе нет нужного — вставь свой в поле ниже.</p>
         <div class="emoji-grid" id="emojiGrid"></div>
+        <div class="emoji-modal__custom">
+            <input type="text" id="emojiCustomInput" placeholder="🎯 свой эмодзи" maxlength="10">
+            <button type="button" class="btn-green" onclick="setEmojiAndSubmit(document.getElementById('emojiCustomInput').value.trim())">Применить</button>
+        </div>
         <div class="emoji-modal__actions">
             <button type="button" class="btn-grey" onclick="setEmojiAndSubmit('')">Без эмодзи (📰 default)</button>
             <button type="button" class="btn-grey" onclick="closeEmojiModal()">Отмена</button>

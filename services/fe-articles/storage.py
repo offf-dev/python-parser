@@ -47,6 +47,29 @@ if engine is None and (config.USE_DB_FOR_RESOURCES or config.USE_DB_FOR_ARTICLES
     config.USE_DB_FOR_ARTICLES = False
 
 
+def prune_old_links() -> int:
+    """Удаляет отправленные (is_send=1) ссылки старше LINKS_RETENTION_DAYS дней.
+    Неотправленные оставляем — это активная очередь trickle-отправки.
+    Возвращает число удалённых строк.
+    """
+    if not SessionLocal or config.READONLY_DB:
+        return 0
+    days = config.LINKS_RETENTION_DAYS
+    if days <= 0:
+        return 0
+    try:
+        with SessionLocal() as session:
+            # MySQL не принимает параметр для INTERVAL — подставляем число явно (после int-каста безопасно)
+            result = session.execute(text(
+                f"DELETE FROM links WHERE is_send = 1 AND created_at < NOW() - INTERVAL {int(days)} DAY"
+            ))
+            session.commit()
+            return result.rowcount or 0
+    except Exception as e:
+        logger.error(f"prune_old_links failed: {e}")
+        return 0
+
+
 def ensure_schema():
     """Idempotent миграции схемы. Безопасно вызывается на каждом старте."""
     if not SessionLocal or config.READONLY_DB:

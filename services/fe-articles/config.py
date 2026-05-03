@@ -28,6 +28,10 @@ PARSER_INTERVAL_MINUTES = int(os.getenv("PARSER_INTERVAL_MINUTES", 10))
 SENDER_INTERVAL_MINUTES = int(os.getenv("SENDER_INTERVAL_MINUTES", 10))
 ENABLE_SCHEDULER = os.getenv("ENABLE_SCHEDULER", "true").lower() not in ("false", "0", "no")
 
+# Авто-удаление старых отправленных ссылок из links. 0 = не удалять.
+# Удаляются только записи с is_send=1 (неотправленные не трогаем — это очередь).
+LINKS_RETENTION_DAYS = int(os.getenv("LINKS_RETENTION_DAYS", 90))
+
 # ====================== Файлы ======================
 DATA_FILE = "data/resources.json"
 LAST_RESULTS_FILE = "data/last_results.json"

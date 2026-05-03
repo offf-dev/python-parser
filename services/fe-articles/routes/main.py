@@ -67,7 +67,7 @@ def index():
                         error = "Ничего не найдено по указанным селекторам"
                     else:
                         df = pd.DataFrame([
-                            {"Заголовок": a["title"], "Ссылка": f"<a href='{a['url']}'>{a['url']}</a>"}
+                            {"Заголовок": a["title"], "Ссылка": f"<a href='{a['url']}' target='_blank' rel='noopener'>{a['url']}</a>"}
                             for a in data
                         ])
                         table = df.to_html(escape=False, index=False)
@@ -204,7 +204,7 @@ async def parse_now():
             return {"success": False, "error": "Ничего не найдено по указанным селекторам"}
 
         df = pd.DataFrame([
-            {"Заголовок": a["title"], "Ссылка": f"<a href='{a['url']}'>{a['url']}</a>"}
+            {"Заголовок": a["title"], "Ссылка": f"<a href='{a['url']}' target='_blank' rel='noopener'>{a['url']}</a>"}
             for a in data
         ])
         return {
