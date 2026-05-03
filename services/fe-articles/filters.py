@@ -42,7 +42,6 @@ def _strip_for_ascii_check(title: str) -> str:
 
 # Языки с не-латинской письменностью — langdetect определяет их надёжно,
 # и ASCII-фоллбэк на них всё равно не сработал бы. Жёстко режем, минуя fallback.
-# (Belt-and-suspenders: ASCII-проверка их и так отсекла бы, но явное лучше неявного.)
 _NON_LATIN_LANGS = frozenset({
     "ru", "uk", "be", "bg", "mk", "sr", "ka",          # кириллица + грузинский
     "ja", "zh-cn", "zh-tw", "ko",                       # CJK
@@ -53,6 +52,22 @@ _NON_LATIN_LANGS = frozenset({
     "el",                                               # греческий
     "am", "ti",                                         # эфиопские
 })
+
+# Латиничные не-английские языки, которые langdetect определяет надёжно
+# при реальном тексте. Блокируем ТОЛЬКО при высокой уверенности (≥ 0.95) —
+# на технических английских заголовках langdetect ставит эти языки с низкой
+# уверенностью (0.4-0.85), и ASCII-фоллбэк должен их пропустить.
+#
+# НЕ включены: af, it, ro — langdetect стабильно ошибается на них для коротких
+# технических английских заголовков.
+_RELIABLY_NON_EN_LATIN = frozenset({
+    "fr", "es", "pt", "de", "nl", "da", "sv", "no", "fi",
+    "pl", "cs", "sk", "hu",
+    "tr", "vi", "id", "tl", "ms",
+    "ca",
+    "hr", "sl",
+})
+_NON_EN_CONFIDENCE_THRESHOLD = 0.95
 
 
 def is_english(title: str) -> bool:
@@ -73,14 +88,28 @@ def is_english(title: str) -> bool:
     if not detect_input:
         return False
 
+    word_count = len(detect_input.split())
+
     try:
         from langdetect import DetectorFactory, detect_langs
 
         DetectorFactory.seed = 0
         try:
             scores = detect_langs(detect_input)
-            if scores and scores[0].lang in _NON_LATIN_LANGS:
-                return False
+            if scores:
+                top = scores[0]
+                # Не-латиница — режем сразу
+                if top.lang in _NON_LATIN_LANGS:
+                    return False
+                # Уверенно определённая латиница не-английская — режем.
+                # ИСКЛЮЧЕНИЕ: на 1-2-словных заголовках langdetect почти всегда
+                # галлюцинирует ('JSX' → 'id(0.99)'); там детектору не доверяем.
+                if (
+                    word_count >= 3
+                    and top.lang in _RELIABLY_NON_EN_LATIN
+                    and top.prob >= _NON_EN_CONFIDENCE_THRESHOLD
+                ):
+                    return False
             top3 = [s.lang for s in scores[:3]]
             if "en" in top3:
                 return True
