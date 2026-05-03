@@ -45,3 +45,53 @@ function clearAll() {
     if (r) r.innerHTML = '';
     document.querySelectorAll('.alert, .table-result').forEach(el => el.remove());
 }
+
+// ====================== Emoji picker ======================
+const EMOJIS = [
+    '🎨','🖌️','✨','💎','🔨','🛠️','⚙️','🔧',
+    '💻','⚛️','🧩','🪲','📦','📡','⚡','🚀',
+    '📝','📰','📚','📖','✏️','📌','🔖','🎓',
+    '🌐','🔗','🖥️','📱','🐴','🔥','🎯','💡',
+    '🎬','🎤','📊','🧪','🔍','🧠','🪄','🌶️',
+];
+
+const saveBtn = document.getElementById('saveBtn');
+if (saveBtn) {
+    saveBtn.addEventListener('click', (e) => {
+        // Перехватываем submit и сначала открываем picker
+        e.preventDefault();
+        openEmojiModal();
+    });
+}
+
+function openEmojiModal() {
+    const grid = document.getElementById('emojiGrid');
+    const current = document.getElementById('emojiInput').value;
+    grid.innerHTML = EMOJIS.map(em => {
+        const sel = em === current ? ' emoji-btn--selected' : '';
+        return `<button type="button" class="emoji-btn${sel}" onclick="setEmojiAndSubmit('${em}')">${em}</button>`;
+    }).join('');
+    document.getElementById('emojiModal').style.display = 'flex';
+}
+
+function closeEmojiModal() {
+    document.getElementById('emojiModal').style.display = 'none';
+}
+
+function setEmojiAndSubmit(emoji) {
+    document.getElementById('emojiInput').value = emoji;
+    closeEmojiModal();
+    // Submit с правильным action=save
+    const form = document.getElementById('parseForm');
+    const actionInput = document.createElement('input');
+    actionInput.type = 'hidden';
+    actionInput.name = 'action';
+    actionInput.value = 'save';
+    form.appendChild(actionInput);
+    form.submit();
+}
+
+// Esc закрывает модалку
+document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') closeEmojiModal();
+});

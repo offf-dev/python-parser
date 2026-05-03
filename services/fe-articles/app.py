@@ -16,11 +16,15 @@ from hypercorn.config import Config
 import bot
 import config
 import scheduler as sched
+import storage
 from logging_setup import setup_logging
 from routes import register_blueprints
 
 
 logger = setup_logging()
+
+# DB-миграции при старте процесса (idempotent, no-op без БД или в READONLY)
+storage.ensure_schema()
 
 
 def create_app() -> Flask:

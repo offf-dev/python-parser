@@ -13,6 +13,25 @@ from logging_setup import get_logger
 
 logger = get_logger()
 
+
+# ====================== Форматирование сообщений ======================
+# Формат: {emoji} <b>{title}</b>\n{BRAILLE_BLANK}\n<a href="...">{ZWSP}</a>
+# - BRAILLE_BLANK на отдельной строке = «пустая» строка, которую Telegram
+#   не схлопывает (обычные \n между двумя инвизами он съедает).
+# - ZWSP внутри <a> делает ссылку невидимой в тексте, но preview под сообщением
+#   всё равно рендерится (фавикон + домен в карточке).
+# - emoji приходит из колонки sites.emoji; если не задан — DEFAULT_EMOJI.
+
+_BRAILLE_BLANK = "⠀"
+_ZWSP = "​"
+DEFAULT_EMOJI = "📰"
+
+
+def format_article(title: str, url: str, emoji: str = None) -> str:
+    """Форматирует одну статью в TG-сообщение."""
+    e = emoji or DEFAULT_EMOJI
+    return f'{e} <b>{title}</b>\n{_BRAILLE_BLANK}\n<a href="{url}">{_ZWSP}</a>'
+
 _articles_app = None
 _articles_bot = None
 _logs_app = None
@@ -44,8 +63,10 @@ async def init_bots():
             logger.error(f"Ошибка инициализации logs-бота: {e}")
 
 
-async def send_articles(text: str):
-    """Шлёт в публичный канал. No-op если бот выключен."""
+async def send_articles(text: str, preview: bool = True):
+    """Шлёт в публичный канал. No-op если бот выключен.
+    По умолчанию preview включён — статьи рендерятся как карточки с фавиконом.
+    """
     if not _articles_bot:
         logger.info(f"[TG-articles OFF] would send: {text[:120]}...")
         return
@@ -53,7 +74,7 @@ async def send_articles(text: str):
         await _articles_bot.send_message(
             chat_id=config.TELEGRAM_CHANNEL_ID_ARTICLES,
             text=text, parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
+            disable_web_page_preview=not preview,
         )
         logger.info(f"[TG-articles ✓] sent: {text[:80]}")
     except Exception as e:

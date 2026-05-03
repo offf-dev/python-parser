@@ -209,6 +209,58 @@ pre {
     border: 1px solid #ddd;
 }
 
+/* ====================== Emoji picker ====================== */
+.emoji-modal {
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+.emoji-modal__backdrop {
+    position: absolute;
+    inset: 0;
+    background: rgba(0,0,0,0.5);
+}
+.emoji-modal__card {
+    position: relative;
+    background: white;
+    padding: 24px;
+    border-radius: 8px;
+    box-shadow: 0 8px 30px rgba(0,0,0,0.3);
+    max-width: 480px;
+    width: 90%;
+}
+.emoji-modal__card h3 { margin: 0 0 8px; }
+.emoji-modal__hint {
+    color: #6c757d;
+    font-size: 14px;
+    margin: 0 0 16px;
+}
+.emoji-modal__actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 16px;
+    justify-content: flex-end;
+}
+.emoji-grid {
+    display: grid;
+    grid-template-columns: repeat(8, 1fr);
+    gap: 6px;
+}
+.emoji-btn {
+    font-size: 22px;
+    padding: 8px;
+    background: #f8f9fa;
+    border: 2px solid transparent;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: background 0.1s, border-color 0.1s;
+}
+.emoji-btn:hover { background: #e9ecef; }
+.emoji-btn--selected { border-color: #007bff; background: #cfe2ff; }
+
 /* ====================== Прочее ====================== */
 .links-row { margin: 20px 0; font-size: 16px; }
 .links-row a { margin-right: 20px; text-decoration: none; }

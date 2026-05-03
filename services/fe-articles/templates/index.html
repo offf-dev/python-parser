@@ -17,6 +17,8 @@
     {% if edit_index is defined %}
         <input type="hidden" name="edit_index" value="{{ edit_index }}">
     {% endif %}
+    <input type="hidden" name="emoji" id="emojiInput" value="{{ resource.emoji if resource and resource.emoji else '' }}">
+
     <input type="text" name="name" placeholder="Название ресурса (например: smashingmagazine.com)" value="{{ resource.name if resource else '' }}" required>
     <input type="text" name="url" placeholder="URL страницы со списком статей (https://...)" value="{{ resource.url if resource else '' }}" required>
     <input type="text" name="item_selector" placeholder="Селектор блока статьи (например: .article)" value="{{ resource.item_selector if resource else '' }}" required>
@@ -25,10 +27,24 @@
 
     <div class="btn-group">
         <button type="submit" name="action" value="parse" class="btn-green" id="parseBtn">Parse resource</button>
-        <button type="submit" name="action" value="save">Save resource</button>
+        <button type="submit" name="action" value="save" id="saveBtn">Save resource</button>
         <button type="button" class="btn-grey" onclick="clearAll()">Clear all</button>
     </div>
 </form>
+
+<!-- Emoji picker modal -->
+<div id="emojiModal" class="emoji-modal" style="display:none;">
+    <div class="emoji-modal__backdrop" onclick="closeEmojiModal()"></div>
+    <div class="emoji-modal__card">
+        <h3>Выбери эмодзи для источника</h3>
+        <p class="emoji-modal__hint">Будет использоваться перед заголовком статьи в Telegram.</p>
+        <div class="emoji-grid" id="emojiGrid"></div>
+        <div class="emoji-modal__actions">
+            <button type="button" class="btn-grey" onclick="setEmojiAndSubmit('')">Без эмодзи (📰 default)</button>
+            <button type="button" class="btn-grey" onclick="closeEmojiModal()">Отмена</button>
+        </div>
+    </div>
+</div>
 
 <div id="loading" class="loading" style="display:none;">⏳ Парсинг страницы... Пожалуйста, подождите</div>
 <div id="parseResult"></div>

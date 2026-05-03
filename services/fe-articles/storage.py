@@ -47,6 +47,28 @@ if engine is None and (config.USE_DB_FOR_RESOURCES or config.USE_DB_FOR_ARTICLES
     config.USE_DB_FOR_ARTICLES = False
 
 
+def ensure_schema():
+    """Idempotent миграции схемы. Безопасно вызывается на каждом старте."""
+    if not SessionLocal or config.READONLY_DB:
+        return
+    try:
+        with SessionLocal() as session:
+            exists = session.execute(text("""
+                SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE()
+                  AND TABLE_NAME = 'sites'
+                  AND COLUMN_NAME = 'emoji'
+            """)).scalar()
+            if not exists:
+                logger.info("Migrating: ALTER TABLE sites ADD COLUMN emoji")
+                session.execute(text(
+                    "ALTER TABLE sites ADD COLUMN emoji VARCHAR(10) NULL"
+                ))
+                session.commit()
+    except Exception as e:
+        logger.error(f"ensure_schema failed: {e}")
+
+
 # ====================== Утилиты ======================
 def extract_domain(url: str) -> str:
     url = re.sub(r"^https?://", "", url)
@@ -109,7 +131,7 @@ def _load_resources_db():
         with SessionLocal() as session:
             rows = session.execute(text("""
                 SELECT id, site_key, site_url AS url, articles_selector, title_selector,
-                       url_selector, active
+                       url_selector, active, emoji
                 FROM sites
                 WHERE active = 1
             """)).fetchall()
@@ -119,6 +141,7 @@ def _load_resources_db():
                 "title_selector": r.title_selector,
                 "link_selector": r.url_selector,
                 "active": bool(r.active),
+                "emoji": r.emoji,
             } for r in rows]
     except Exception as e:
         logger.error(f"Ошибка загрузки ресурсов из БД: {e}")
@@ -302,7 +325,7 @@ def get_all_sites():
             with SessionLocal() as session:
                 rows = session.execute(text("""
                     SELECT id, site_key, site_url AS url, articles_selector, title_selector,
-                           url_selector, active
+                           url_selector, active, emoji
                     FROM sites
                     ORDER BY CASE WHEN articles_selector IS NULL THEN 1 ELSE 0 END, updated_at DESC
                 """)).fetchall()
@@ -313,6 +336,7 @@ def get_all_sites():
                     "title_selector": r.title_selector,
                     "url_selector": r.url_selector,
                     "active": bool(r.active),
+                    "emoji": r.emoji,
                 } for r in rows]
         except Exception as e:
             logger.error(f"Ошибка get_all_sites БД: {e}")
@@ -325,6 +349,7 @@ def get_all_sites():
         "title_selector": r.get("title_selector", ""),
         "url_selector": r.get("link_selector", ""),
         "active": r.get("active", False),
+        "emoji": r.get("emoji"),
     } for i, r in enumerate(resources)]
 
 

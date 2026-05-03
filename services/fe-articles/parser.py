@@ -276,8 +276,7 @@ async def run_auto_parse():
                 if config.READONLY_DB:
                     for it in new_items:
                         await bot.send_articles(
-                            f"🧪 <b>PREVIEW</b> · {res['name']}\n"
-                            f'<a href="{it["url"]}">{it["title"]}</a>'
+                            bot.format_article(it["title"], it["url"], res.get("emoji"))
                         )
 
         # Bulk-summary в logs-чат, не в публичный канал (per docs/parser.md §5)

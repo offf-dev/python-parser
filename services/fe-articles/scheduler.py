@@ -42,23 +42,25 @@ async def send_oldest_unsent_article():
             if config.USE_DB_FOR_ARTICLES and storage.SessionLocal:
                 with storage.SessionLocal() as session:
                     article = session.execute(text("""
-                        SELECT id, title, url, created_at
-                        FROM links
-                        WHERE is_send = 0
-                        ORDER BY created_at ASC, id ASC
+                        SELECT l.id, l.title, l.url, l.created_at, s.emoji
+                        FROM links l
+                        LEFT JOIN sites s ON l.site_id = s.id
+                        WHERE l.is_send = 0
+                        ORDER BY l.created_at ASC, l.id ASC
                         LIMIT 1
                     """)).mappings().first()
                     if not article:
                         return
-                    msg = (
-                        f'<a href="{article["url"]}">{article["title"]}</a>'
-                    )
+                    msg = bot.format_article(article["title"], article["url"], article.get("emoji"))
                     await bot.send_articles(msg)
-                    session.execute(
-                        text("UPDATE links SET is_send = 1, updated_at = NOW() WHERE id = :id"),
-                        {"id": article["id"]},
-                    )
-                    session.commit()
+                    if config.READONLY_DB:
+                        logger.info(f"[READONLY] would mark is_send=1 для id={article['id']}")
+                    else:
+                        session.execute(
+                            text("UPDATE links SET is_send = 1, updated_at = NOW() WHERE id = :id"),
+                            {"id": article["id"]},
+                        )
+                        session.commit()
                     logger.info(f"Отправлена статья: {article['title'][:80]}")
                 return
 
@@ -74,7 +76,13 @@ async def send_oldest_unsent_article():
                             target_site, target_idx, target_art = site_name, idx, art
             if target_art is None:
                 return
-            await bot.send_articles(f'<a href="{target_art["url"]}">{target_art["title"]}</a>')
+            # Найти emoji для site_name среди ресурсов JSON
+            emoji = None
+            for r in storage.load_resources():
+                if r.get("name") == target_site:
+                    emoji = r.get("emoji")
+                    break
+            await bot.send_articles(bot.format_article(target_art["title"], target_art["url"], emoji))
             last[target_site][target_idx]["is_send"] = True
             storage.save_last_results(last)
             logger.info(f"[JSON] Отправлена: {target_art['title'][:80]}")
