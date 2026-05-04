@@ -21,30 +21,28 @@ logger = get_logger()
 
 parse_lock = asyncio.Lock()
 
-# Аудит доменов без своего эмодзи — кулдаун чтобы не алертить каждые 10 мин
-_LAST_EMOJI_AUDIT_TS = 0.0
-_EMOJI_AUDIT_COOLDOWN = 24 * 3600  # раз в сутки
+# Аудит доменов без своего эмодзи — отслеживаем те, про которые уже алертили,
+# чтобы не спамить тем же списком каждый цикл, но при этом сразу замечать новые
+# домены, пересёкшие порог. Set сбрасывается при рестарте контейнера.
+_ALERTED_DOMAIN_IDS: set[int] = set()
 
 
 async def _audit_default_emoji_domains():
-    global _LAST_EMOJI_AUDIT_TS
-    now = time.time()
-    if now - _LAST_EMOJI_AUDIT_TS < _EMOJI_AUDIT_COOLDOWN:
-        return
     needs = storage.get_domains_needing_emoji(min_articles=5)
-    if not needs:
-        _LAST_EMOJI_AUDIT_TS = now
+    fresh = [d for d in needs if d["id"] not in _ALERTED_DOMAIN_IDS]
+    if not fresh:
         return
-    lines = [f"• <b>{d['name']}</b> — {d['articles_count']} ст." for d in needs[:30]]
+    lines = [f"• <b>{d['name']}</b> — {d['articles_count']} ст." for d in fresh[:30]]
     msg = (
-        f"🟢 Доменов без своего эмодзи (с 🌐) и ≥5 статей: {len(needs)}\n\n"
+        f"🟢 Новых доменов без своего эмодзи (с 🌐) и ≥5 статей: {len(fresh)}\n\n"
         + "\n".join(lines)
     )
-    if len(needs) > 30:
-        msg += f"\n\n…ещё {len(needs) - 30}"
+    if len(fresh) > 30:
+        msg += f"\n\n…ещё {len(fresh) - 30}"
     msg += "\n\nПоставь свой эмодзи на /domains"
     await bot.send_log(msg)
-    _LAST_EMOJI_AUDIT_TS = now
+    for d in fresh:
+        _ALERTED_DOMAIN_IDS.add(d["id"])
 
 
 _DEFAULT_HEADERS = {
