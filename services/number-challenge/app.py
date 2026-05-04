@@ -191,6 +191,7 @@ HTML = '''<!DOCTYPE html>
 <head>
     <meta charset="UTF-8">
     <title>Number Challenge — Триггер-бот</title>
+    <link rel="icon" type="image/svg+xml" href='data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><text y=".9em" font-size="90">🧩</text></svg>'>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
         body {font-family: system-ui, sans-serif; background:#0d1117; color:#c9d1d9; margin:0; padding:20px;}
