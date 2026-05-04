@@ -24,11 +24,13 @@ def register_blueprints(app):
     from routes.sites import bp as sites_bp
     from routes.links import bp as links_bp
     from routes.debug import bp as debug_bp
+    from routes.favicons import bp as favicons_bp
 
     app.register_blueprint(main_bp)
     app.register_blueprint(sites_bp)
     app.register_blueprint(links_bp)
     app.register_blueprint(debug_bp)
+    app.register_blueprint(favicons_bp)
 
     @app.context_processor
     def inject_modes():

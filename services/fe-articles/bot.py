@@ -30,7 +30,7 @@ DEFAULT_EMOJI = "📰"
 def format_article(title: str, url: str, emoji: str = None) -> str:
     """Форматирует одну статью в TG-сообщение."""
     e = emoji or DEFAULT_EMOJI
-    return f'{e} <b>{title}</b>\n<a href="{url}">{_ZWSP}</a>'
+    return f'{e} <b>{title}</b><a href="{url}">{_ZWSP}</a>'
 
 _articles_app = None
 _articles_bot = None
