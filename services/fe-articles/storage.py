@@ -169,6 +169,35 @@ def get_emoji_for_url(url: str) -> str:
         return DEFAULT_DOMAIN_EMOJI
 
 
+def get_domains_needing_emoji(min_articles: int = 5):
+    """Список доменов у которых стоит дефолтный 🌐 (или пусто) И есть min_articles+ статей.
+    Сортировка: больше статей → раньше в списке.
+
+    BINARY сравнение — utf8mb4_unicode_ci некорректно равняет некоторые эмодзи,
+    нужен побайтный матч.
+    """
+    if not SessionLocal:
+        return []
+    try:
+        with SessionLocal() as s:
+            rows = s.execute(text("""
+                SELECT d.id, d.name, d.emoji, COUNT(l.id) AS articles_count
+                FROM domains d
+                LEFT JOIN links l ON l.domain_id = d.id
+                WHERE d.emoji IS NULL
+                   OR d.emoji = ''
+                   OR d.emoji = '?'
+                   OR BINARY d.emoji = BINARY :default_e
+                GROUP BY d.id, d.name, d.emoji
+                HAVING articles_count >= :min_a
+                ORDER BY articles_count DESC, d.name ASC
+            """), {"default_e": DEFAULT_DOMAIN_EMOJI, "min_a": min_articles}).mappings().fetchall()
+            return [dict(r) for r in rows]
+    except Exception as e:
+        logger.error(f"get_domains_needing_emoji failed: {e}")
+        return []
+
+
 def get_all_domains():
     """Список доменов с эмодзи и числом статей. Сортировка: число статей DESC."""
     if not SessionLocal:

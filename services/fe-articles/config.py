@@ -20,6 +20,12 @@ TELEGRAM_CHANNEL_ID_ARTICLES = _int_or_none("TG_CHAT_ID_FOR_ARTICLES")
 TELEGRAM_TOKEN_LOGS = os.getenv("TG_BOT_TOKEN_FOR_LOGS") or None
 TELEGRAM_CHANNEL_ID_LOGS = _int_or_none("TG_CHAT_ID_FOR_LOGS")
 
+# Куда уходит bulk-сводка цикла парсинга и стартовое сообщение «Парсер запущен».
+# Если не задано — fallback на articles-канал. Удобно: при переезде articles
+# на боевой канал, summary можно оставить на тестовом, потом совсем выключить.
+TELEGRAM_CHANNEL_ID_SUMMARY = _int_or_none("TG_CHAT_ID_FOR_SUMMARY") or TELEGRAM_CHANNEL_ID_ARTICLES
+ENABLE_PARSE_SUMMARY = os.getenv("ENABLE_PARSE_SUMMARY", "true").lower() not in ("false", "0", "no")
+
 ARTICLES_BOT_ENABLED = bool(TELEGRAM_TOKEN_ARTICLES and TELEGRAM_CHANNEL_ID_ARTICLES)
 LOGS_BOT_ENABLED = bool(TELEGRAM_TOKEN_LOGS and TELEGRAM_CHANNEL_ID_LOGS)
 

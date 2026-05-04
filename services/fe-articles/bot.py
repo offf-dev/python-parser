@@ -100,6 +100,27 @@ async def send_articles(text: str, preview: bool = True):
         await send_log(msg)
 
 
+async def send_summary(text: str):
+    """Шлёт сводку цикла парсинга / стартовое сообщение в summary-канал.
+    No-op если ENABLE_PARSE_SUMMARY=false или articles-бот не поднят.
+    """
+    if not config.ENABLE_PARSE_SUMMARY:
+        logger.info(f"[TG-summary OFF by env] would send: {text[:120]}")
+        return
+    if not _articles_bot or not config.TELEGRAM_CHANNEL_ID_SUMMARY:
+        logger.info(f"[TG-summary OFF] would send: {text[:120]}")
+        return
+    try:
+        await _articles_bot.send_message(
+            chat_id=config.TELEGRAM_CHANNEL_ID_SUMMARY,
+            text=text, parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+        logger.info(f"[TG-summary ✓] sent: {text[:80]}")
+    except Exception as e:
+        logger.error(f"НЕ УДАЛОСЬ отправить summary: {e}")
+
+
 async def send_log(error_msg: str):
     """Шлёт в админ-чат. No-op если бот выключен."""
     if not _logs_bot:

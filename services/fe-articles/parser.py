@@ -21,6 +21,31 @@ logger = get_logger()
 
 parse_lock = asyncio.Lock()
 
+# Аудит доменов без своего эмодзи — кулдаун чтобы не алертить каждые 10 мин
+_LAST_EMOJI_AUDIT_TS = 0.0
+_EMOJI_AUDIT_COOLDOWN = 24 * 3600  # раз в сутки
+
+
+async def _audit_default_emoji_domains():
+    global _LAST_EMOJI_AUDIT_TS
+    now = time.time()
+    if now - _LAST_EMOJI_AUDIT_TS < _EMOJI_AUDIT_COOLDOWN:
+        return
+    needs = storage.get_domains_needing_emoji(min_articles=5)
+    if not needs:
+        _LAST_EMOJI_AUDIT_TS = now
+        return
+    lines = [f"• <b>{d['name']}</b> — {d['articles_count']} ст." for d in needs[:30]]
+    msg = (
+        f"🟢 Доменов без своего эмодзи (с 🌐) и ≥5 статей: {len(needs)}\n\n"
+        + "\n".join(lines)
+    )
+    if len(needs) > 30:
+        msg += f"\n\n…ещё {len(needs) - 30}"
+    msg += "\n\nПоставь свой эмодзи на /domains"
+    await bot.send_log(msg)
+    _LAST_EMOJI_AUDIT_TS = now
+
 
 _DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
@@ -299,13 +324,16 @@ async def run_auto_parse():
                 message += f"\n\n🧪 READONLY: новых {len(all_new)} (preview уже улетел в articles)"
             else:
                 message += f"\n\nНовых статей: {len(all_new)} (уйдут в канал по trickle-расписанию)"
-        await bot.send_articles(message, preview=False)
+        await bot.send_summary(message)
 
         elapsed = time.perf_counter() - start
         logger.info(
             f"Автопарсинг занял {elapsed:.2f}с | "
             f"всего новых: {len(all_new)} | ошибок: {len(errors)}"
         )
+
+        # Аудит: домены с дефолтным 🌐 и >5 статей → алерт в logs-чат раз в сутки
+        await _audit_default_emoji_domains()
     except Exception as e:
         msg = f"Ошибка в автопарсинге: {e}\n{traceback.format_exc()}"
         logger.error(msg)
