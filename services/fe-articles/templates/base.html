@@ -41,11 +41,19 @@
     // элементами (pagination после ajax updatePage и т.п.).
     document.addEventListener('submit', () => showLoader());
     document.addEventListener('click', (e) => {
+        // Cmd/Ctrl/Shift/Alt-клик или средняя кнопка — браузер открывает
+        // в новой табе/окне, текущая страница не уходит. Loader не нужен.
+        if (e.ctrlKey || e.metaKey || e.shiftKey || e.altKey || e.button === 1) return;
         const a = e.target.closest('a[href]');
         if (!a || a.target === '_blank') return;
         const h = a.getAttribute('href');
         if (!h || h.startsWith('#') || h.startsWith('javascript:')) return;
         showLoader();
+    });
+    // Auxclick для middle-click (некоторые браузеры не шлют его в обычный click)
+    document.addEventListener('auxclick', (e) => {
+        // Не показываем loader на middle-click — это всегда new-tab
+        // (handler пуст, нужен только чтобы не пересечься с регулярным click)
     });
 
     // На bfcache-восстановление (Back/Forward) — гарантированно скрыть loader.

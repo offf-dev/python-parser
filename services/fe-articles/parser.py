@@ -99,8 +99,14 @@ async def fetch_html(url: str, *, headers=None, retries=None, timeout_ms=None) -
         for attempt in range(retries):
             try:
                 await asyncio.sleep(random.uniform(1, 3))
-                await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-                await page.wait_for_timeout(3000)
+                # networkidle ждёт пока JS дорендерится. Если сайт никогда не утихает
+                # (постоянные analytics-запросы) — упадёт по таймауту, тогда fallback
+                # на domcontentloaded + дольше wait.
+                try:
+                    await page.goto(url, wait_until="networkidle", timeout=20000)
+                except Exception:
+                    await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                    await page.wait_for_timeout(5000)
                 break
             except Exception as e:
                 last_err = e
