@@ -33,7 +33,7 @@ ALLOWED_EXTS = {"ico", "png", "svg", "jpg", "jpeg", "gif", "webp"}
 # (например, medium.com отдаёт мелкую плоскую "M" которая теряется),
 # подсовываем нужный URL вручную. Будет скачан и закэширован как обычно.
 _FAVICON_OVERRIDES = {
-    "medium.com": "https://miro.medium.com/v2/5d8de952517e8160e40ef9841c781cdc14a5db313057fa3c3de41c6f5b494b19",
+    "medium.com": "https://uxwing.com/wp-content/themes/uxwing/download/brands-and-social-media/medium-logo-icon.png",
 }
 
 # Заголовки чтобы прикинуться браузером (некоторые сайты режут python-requests)
