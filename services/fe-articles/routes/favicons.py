@@ -29,6 +29,13 @@ CACHE_DIR = "static/icons"
 CACHE_TTL_SECONDS = 30 * 24 * 3600  # 30 дней
 ALLOWED_EXTS = {"ico", "png", "svg", "jpg", "jpeg", "gif", "webp"}
 
+# Точечные оверрайды — когда автопарсинг <link rel=icon> даёт плохую иконку
+# (например, medium.com отдаёт мелкую плоскую "M" которая теряется),
+# подсовываем нужный URL вручную. Будет скачан и закэширован как обычно.
+_FAVICON_OVERRIDES = {
+    "medium.com": "https://miro.medium.com/v2/5d8de952517e8160e40ef9841c781cdc14a5db313057fa3c3de41c6f5b494b19",
+}
+
 # Заголовки чтобы прикинуться браузером (некоторые сайты режут python-requests)
 _HEADERS = {
     "User-Agent": (
@@ -72,6 +79,10 @@ def _fetch_favicon(domain: str) -> str | None:
     site_url = f"https://{domain}/"
 
     candidate_urls = []
+    # Override берём в первую очередь — если успешно скачается, до парсинга
+    # сайта не дойдём.
+    if domain in _FAVICON_OVERRIDES:
+        candidate_urls.append(_FAVICON_OVERRIDES[domain])
     try:
         r = requests.get(site_url, headers=_HEADERS, timeout=5, allow_redirects=True)
         if r.ok:
@@ -89,18 +100,29 @@ def _fetch_favicon(domain: str) -> str | None:
     # Fallback: стандартный /favicon.ico
     candidate_urls.append(urljoin(site_url, "/favicon.ico"))
 
+    _CT_TO_EXT = {
+        "image/png": "png", "image/jpeg": "jpg", "image/jpg": "jpg",
+        "image/svg+xml": "svg", "image/x-icon": "ico",
+        "image/vnd.microsoft.icon": "ico", "image/gif": "gif", "image/webp": "webp",
+    }
     for cand in candidate_urls:
         try:
-            ext = urlparse(cand).path.rsplit(".", 1)[-1].lower().split("?")[0]
-            if ext not in ALLOWED_EXTS:
-                ext = "ico"
             resp = requests.get(cand, headers=_HEADERS, timeout=5, allow_redirects=True)
-            if resp.ok and resp.content and len(resp.content) > 50:
-                path = os.path.join(CACHE_DIR, f"{safe}.{ext}")
-                with open(path, "wb") as f:
-                    f.write(resp.content)
-                logger.info(f"favicon saved: {domain} → {path} ({len(resp.content)}B)")
-                return path
+            if not (resp.ok and resp.content and len(resp.content) > 50):
+                continue
+            # Сначала смотрим Content-Type ответа, потом расширение из URL
+            ct = resp.headers.get("Content-Type", "").split(";")[0].strip().lower()
+            if ct in _CT_TO_EXT:
+                ext = _CT_TO_EXT[ct]
+            else:
+                ext = urlparse(cand).path.rsplit(".", 1)[-1].lower().split("?")[0]
+                if ext not in ALLOWED_EXTS:
+                    ext = "ico"
+            path = os.path.join(CACHE_DIR, f"{safe}.{ext}")
+            with open(path, "wb") as f:
+                f.write(resp.content)
+            logger.info(f"favicon saved: {domain} → {path} ({len(resp.content)}B, ct={ct})")
+            return path
         except Exception as e:
             logger.warning(f"favicon download failed {cand}: {e}")
     return None

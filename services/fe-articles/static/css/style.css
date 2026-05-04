@@ -390,6 +390,12 @@ td.cell-site-key {
     word-break: break-all;
     max-width: 280px;
 }
+td.cell-favicon {
+    width: 32px;
+    text-align: center;
+    padding: 8px;
+}
+.favicon--solo { margin-right: 0; }
 
 /* M3 Switch-style чекбокс */
 .checkbox {
