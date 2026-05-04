@@ -71,8 +71,14 @@ _STEALTH_INIT = [
 ]
 
 
-async def fetch_html(url: str, *, headers=None, retries=None, timeout_ms=None) -> str:
-    """Headless Playwright Chromium с антидетект-настройками."""
+async def fetch_html(url: str, *, headers=None, retries=None, timeout_ms=None,
+                     wait_for_selector: str = None) -> str:
+    """Headless Playwright Chromium с антидетект-настройками.
+
+    Если задан wait_for_selector — ждём пока он появится в DOM (до 25с).
+    Это надёжнее чем networkidle для JS-рендеренных листингов: гарантия что
+    нужный нам контент уже сгенерирован.
+    """
     headers = headers or _DEFAULT_HEADERS
     retries = retries or config.PAGE_GOTO_RETRIES
     timeout_ms = timeout_ms or config.PAGE_GOTO_TIMEOUT_MS
@@ -99,14 +105,27 @@ async def fetch_html(url: str, *, headers=None, retries=None, timeout_ms=None) -
         for attempt in range(retries):
             try:
                 await asyncio.sleep(random.uniform(1, 3))
-                # networkidle ждёт пока JS дорендерится. Если сайт никогда не утихает
-                # (постоянные analytics-запросы) — упадёт по таймауту, тогда fallback
-                # на domcontentloaded + дольше wait.
-                try:
-                    await page.goto(url, wait_until="networkidle", timeout=20000)
-                except Exception:
-                    await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-                    await page.wait_for_timeout(5000)
+                await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                if wait_for_selector:
+                    # Ждём конкретный селектор. Если не появится за 25с — попробуем
+                    # networkidle и фиксированный wait как fallback.
+                    try:
+                        await page.wait_for_selector(wait_for_selector, timeout=25000)
+                    except Exception:
+                        logger.warning(
+                            f"selector '{wait_for_selector}' never appeared on {url} — "
+                            f"fall back to networkidle"
+                        )
+                        try:
+                            await page.wait_for_load_state("networkidle", timeout=15000)
+                        except Exception:
+                            pass
+                        await page.wait_for_timeout(3000)
+                else:
+                    try:
+                        await page.wait_for_load_state("networkidle", timeout=20000)
+                    except Exception:
+                        await page.wait_for_timeout(5000)
                 break
             except Exception as e:
                 last_err = e
@@ -230,7 +249,10 @@ async def parse_resource(resource: dict, limit: int = None, blocked_keywords: li
         blocked_keywords = storage.load_blocked_keywords()
     try:
         logger.info(f"Парсим: {resource['name']} → {resource['url']}")
-        html = await fetch_html(resource["url"])
+        html = await fetch_html(
+            resource["url"],
+            wait_for_selector=resource.get("item_selector"),
+        )
         logger.info(f"HTML длина: {len(html)}")
 
         data = extract_articles(
