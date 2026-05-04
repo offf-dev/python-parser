@@ -53,6 +53,7 @@ function applyCustomEmoji() {
 async function setEmojiForDomain(emoji) {
     if (!currentDomainId || !emoji) return;
     const id = currentDomainId;
+    showLoader();
     try {
         const r = await fetch(`/domains/${id}/emoji`, {
             method: 'POST',
@@ -70,6 +71,8 @@ async function setEmojiForDomain(emoji) {
         }
     } catch (e) {
         alert('Сетевая ошибка: ' + e.message);
+    } finally {
+        hideLoader();
     }
 }
 

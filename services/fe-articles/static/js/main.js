@@ -35,6 +35,7 @@ document.addEventListener('DOMContentLoaded', () => {
             btn.disabled = false;
             btn.textContent = originalText;
             loading.style.display = 'none';
+            hideLoader();
         }
     });
 });

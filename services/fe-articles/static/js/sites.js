@@ -7,6 +7,7 @@ function debounce(fn, delay) {
 }
 
 function updatePage(url) {
+    showLoader();
     fetch(url)
         .then(r => r.text())
         .then(html => {
@@ -16,7 +17,8 @@ function updatePage(url) {
             history.pushState(null, '', url);
             attachEventListeners();
         })
-        .catch(err => console.error('updatePage:', err));
+        .catch(err => console.error('updatePage:', err))
+        .finally(() => hideLoader());
 }
 
 function attachEventListeners() {
@@ -44,21 +46,23 @@ function toggleCheckbox(identifier, isActive) {
         console.error('toggleCheckbox: пустой identifier');
         return;
     }
+    showLoader();
     fetch(`/sites/toggle?identifier=${encodeURIComponent(identifier)}&active=${isActive}`)
         .then(r => {
             if (!r.ok) throw new Error('HTTP ' + r.status);
             location.reload();
         })
-        .catch(err => console.error('toggle:', err));
+        .catch(err => { hideLoader(); console.error('toggle:', err); });
 }
 
 function deleteSite(siteId, siteKey) {
     if (!confirm(`Удалить сайт "${siteKey}"?`)) return;
+    showLoader();
     fetch('/sites/delete', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ id: siteId }),
-    }).then(() => location.reload());
+    }).then(() => location.reload()).catch(() => hideLoader());
 }
 
 function resetFilter() {

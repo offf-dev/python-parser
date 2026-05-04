@@ -7,6 +7,7 @@ function debounce(fn, delay) {
 }
 
 function updatePage(url) {
+    showLoader();
     fetch(url)
         .then(r => r.text())
         .then(html => {
@@ -16,7 +17,8 @@ function updatePage(url) {
             history.pushState(null, '', url);
             attachEventListeners();
         })
-        .catch(err => console.error('updatePage:', err));
+        .catch(err => console.error('updatePage:', err))
+        .finally(() => hideLoader());
 }
 
 function handleInput() {
@@ -45,18 +47,20 @@ function attachEventListeners() {
 }
 
 function toggleLink(url, isSend) {
+    showLoader();
     fetch(`/links/toggle?url=${encodeURIComponent(url)}&is_send=${isSend}`)
         .then(r => { if (!r.ok) throw new Error(r.status); location.reload(); })
-        .catch(err => alert('Ошибка: ' + err.message));
+        .catch(err => { hideLoader(); alert('Ошибка: ' + err.message); });
 }
 
 function deleteLink(siteName, url) {
     if (!confirm(`Удалить статью с URL "${url}"?`)) return;
+    showLoader();
     fetch('/links/delete', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ site_name: siteName, url }),
-    }).then(() => location.reload());
+    }).then(() => location.reload()).catch(() => hideLoader());
 }
 
 function resetFilter() {

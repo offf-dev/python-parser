@@ -28,6 +28,30 @@
     {% block content %}{% endblock %}
 </main>
 
+<!-- Global page-loader overlay -->
+<div id="globalLoader" class="loader-overlay" style="display:none;">
+    <div class="loader-spinner"></div>
+</div>
+
+<script>
+    window.showLoader = () => { document.getElementById('globalLoader').style.display = 'flex'; };
+    window.hideLoader = () => { document.getElementById('globalLoader').style.display = 'none'; };
+
+    // Event delegation чтобы работать с динамически вставляемыми
+    // элементами (pagination после ajax updatePage и т.п.).
+    document.addEventListener('submit', () => showLoader());
+    document.addEventListener('click', (e) => {
+        const a = e.target.closest('a[href]');
+        if (!a || a.target === '_blank') return;
+        const h = a.getAttribute('href');
+        if (!h || h.startsWith('#') || h.startsWith('javascript:')) return;
+        showLoader();
+    });
+
+    // На bfcache-восстановление (Back/Forward) — гарантированно скрыть loader.
+    window.addEventListener('pageshow', () => hideLoader());
+</script>
+
 {% block scripts %}{% endblock %}
 </body>
 </html>
