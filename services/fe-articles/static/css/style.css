@@ -358,6 +358,17 @@ tbody tr:hover td { background: var(--surface-low); }
     font-size: 16px;
     vertical-align: middle;
 }
+.emoji-cell {
+    background: var(--surface-mid);
+    border: none;
+    border-radius: var(--radius-sm);
+    padding: 6px 12px;
+    font-size: 22px;
+    line-height: 1;
+    cursor: pointer;
+    transition: background 0.1s;
+}
+.emoji-cell:hover { background: var(--surface-highest); }
 td a { color: var(--primary); }
 td a:hover { color: var(--on-primary-container); text-decoration: underline; }
 td strong { color: var(--on-surface); font-weight: 600; }

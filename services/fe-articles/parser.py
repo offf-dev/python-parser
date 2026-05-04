@@ -280,8 +280,9 @@ async def run_auto_parse():
                 # увидит, что бы ушло в канал — preview-публикация.
                 if config.READONLY_DB:
                     for it in new_items:
+                        emoji = storage.get_emoji_for_url(it["url"])
                         await bot.send_articles(
-                            bot.format_article(it["title"], it["url"], res.get("emoji"))
+                            bot.format_article(it["title"], it["url"], emoji)
                         )
 
         # Bulk-summary в articles-канал — это операционная сводка прогона

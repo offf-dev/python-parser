@@ -70,23 +70,42 @@ def prune_old_links() -> int:
         return 0
 
 
+DEFAULT_DOMAIN_EMOJI = "🌐"
+
+
 def ensure_schema():
     """Idempotent миграции схемы. Безопасно вызывается на каждом старте."""
     if not SessionLocal or config.READONLY_DB:
         return
     try:
         with SessionLocal() as session:
-            exists = session.execute(text("""
+            # 1) domains.emoji — добавить если нет, инициализировать всех на 🌐
+            d_emoji = session.execute(text("""
+                SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE()
+                  AND TABLE_NAME = 'domains'
+                  AND COLUMN_NAME = 'emoji'
+            """)).scalar()
+            if not d_emoji:
+                logger.info("Migrating: ALTER TABLE domains ADD COLUMN emoji")
+                session.execute(text(
+                    "ALTER TABLE domains ADD COLUMN emoji VARCHAR(10) NULL"
+                ))
+                session.execute(text(
+                    "UPDATE domains SET emoji = :e WHERE emoji IS NULL"
+                ), {"e": DEFAULT_DOMAIN_EMOJI})
+                session.commit()
+
+            # 2) sites.emoji — удалить если ещё есть (старая схема, теперь не используется)
+            s_emoji = session.execute(text("""
                 SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
                 WHERE TABLE_SCHEMA = DATABASE()
                   AND TABLE_NAME = 'sites'
                   AND COLUMN_NAME = 'emoji'
             """)).scalar()
-            if not exists:
-                logger.info("Migrating: ALTER TABLE sites ADD COLUMN emoji")
-                session.execute(text(
-                    "ALTER TABLE sites ADD COLUMN emoji VARCHAR(10) NULL"
-                ))
+            if s_emoji:
+                logger.info("Migrating: ALTER TABLE sites DROP COLUMN emoji")
+                session.execute(text("ALTER TABLE sites DROP COLUMN emoji"))
                 session.commit()
     except Exception as e:
         logger.error(f"ensure_schema failed: {e}")
@@ -113,14 +132,62 @@ def find_or_create_domain(name: str):
                     return None
                 logger.info(f"Создание нового домена: {name}")
                 session.execute(text(
-                    "INSERT INTO domains (name, created_at, updated_at) VALUES (:name, NOW(), NOW())"
-                ), {"name": name})
+                    "INSERT INTO domains (name, emoji, created_at, updated_at) "
+                    "VALUES (:name, :e, NOW(), NOW())"
+                ), {"name": name, "e": DEFAULT_DOMAIN_EMOJI})
                 session.commit()
                 domain_id = session.execute(text("SELECT LAST_INSERT_ID()")).scalar()
             return domain_id
     except Exception as e:
         logger.error(f"Ошибка find_or_create_domain для {name}: {e}\n{traceback.format_exc()}")
         return None
+
+
+def get_emoji_for_url(url: str) -> str:
+    """Эмодзи для URL по его домену. Возвращает DEFAULT_DOMAIN_EMOJI если ничего не найдено."""
+    if not SessionLocal:
+        return DEFAULT_DOMAIN_EMOJI
+    domain = extract_domain(url)
+    try:
+        with SessionLocal() as s:
+            e = s.execute(text("SELECT emoji FROM domains WHERE name = :n"), {"n": domain}).scalar()
+            return e or DEFAULT_DOMAIN_EMOJI
+    except Exception:
+        return DEFAULT_DOMAIN_EMOJI
+
+
+def get_all_domains():
+    """Список доменов с эмодзи и числом статей. Сортировка: число статей DESC."""
+    if not SessionLocal:
+        return []
+    try:
+        with SessionLocal() as s:
+            rows = s.execute(text("""
+                SELECT d.id, d.name, d.emoji, COUNT(l.id) AS articles_count
+                FROM domains d
+                LEFT JOIN links l ON l.domain_id = d.id
+                GROUP BY d.id, d.name, d.emoji
+                ORDER BY articles_count DESC, d.name ASC
+            """)).mappings().fetchall()
+            return [dict(r) for r in rows]
+    except Exception as e:
+        logger.error(f"Ошибка get_all_domains: {e}")
+        return []
+
+
+def update_domain_emoji(domain_id: int, emoji: str):
+    if not SessionLocal or config.READONLY_DB:
+        return False
+    try:
+        with SessionLocal() as s:
+            s.execute(text(
+                "UPDATE domains SET emoji = :e, updated_at = NOW() WHERE id = :id"
+            ), {"e": emoji or DEFAULT_DOMAIN_EMOJI, "id": int(domain_id)})
+            s.commit()
+            return True
+    except Exception as e:
+        logger.error(f"Ошибка update_domain_emoji: {e}")
+        return False
 
 
 # ====================== Resources (JSON или sites table) ======================
@@ -154,7 +221,7 @@ def _load_resources_db():
         with SessionLocal() as session:
             rows = session.execute(text("""
                 SELECT id, site_key, site_url AS url, articles_selector, title_selector,
-                       url_selector, active, emoji
+                       url_selector, active
                 FROM sites
                 WHERE active = 1
             """)).fetchall()
@@ -164,7 +231,6 @@ def _load_resources_db():
                 "title_selector": r.title_selector,
                 "link_selector": r.url_selector,
                 "active": bool(r.active),
-                "emoji": r.emoji,
             } for r in rows]
     except Exception as e:
         logger.error(f"Ошибка загрузки ресурсов из БД: {e}")
@@ -348,7 +414,7 @@ def get_all_sites():
             with SessionLocal() as session:
                 rows = session.execute(text("""
                     SELECT id, site_key, site_url AS url, articles_selector, title_selector,
-                           url_selector, active, emoji
+                           url_selector, active
                     FROM sites
                     ORDER BY CASE WHEN articles_selector IS NULL THEN 1 ELSE 0 END, updated_at DESC
                 """)).fetchall()
@@ -359,7 +425,6 @@ def get_all_sites():
                     "title_selector": r.title_selector,
                     "url_selector": r.url_selector,
                     "active": bool(r.active),
-                    "emoji": r.emoji,
                 } for r in rows]
         except Exception as e:
             logger.error(f"Ошибка get_all_sites БД: {e}")
@@ -372,7 +437,6 @@ def get_all_sites():
         "title_selector": r.get("title_selector", ""),
         "url_selector": r.get("link_selector", ""),
         "active": r.get("active", False),
-        "emoji": r.get("emoji"),
     } for i, r in enumerate(resources)]
 
 
@@ -385,10 +449,7 @@ def get_all_links():
                 rows = session.execute(text("""
                     SELECT l.id, l.title, l.url, l.is_send, l.created_at,
                            COALESCE(d.name, '—') as site_name,
-                           (SELECT s.emoji FROM sites s
-                            WHERE s.emoji IS NOT NULL
-                              AND SUBSTRING_INDEX(s.site_key, '/', 1) = d.name
-                            LIMIT 1) as site_emoji
+                           d.emoji as site_emoji
                     FROM links l
                     LEFT JOIN domains d ON l.domain_id = d.id
                     ORDER BY l.id DESC
@@ -398,9 +459,8 @@ def get_all_links():
             logger.error(f"Ошибка get_all_links БД: {e}\n{traceback.format_exc()}")
             return []
 
-    # JSON-режим: маппим эмодзи из ресурсов
+    # JSON-режим: эмодзи не поддерживается (нет таблицы domains в JSON)
     last = load_last_results()
-    emoji_by_name = {r.get("name"): r.get("emoji") for r in load_resources()}
     out = []
     lid = 1
     for site_name, articles in last.items():
@@ -413,7 +473,7 @@ def get_all_links():
                 "is_send": art.get("is_send", False),
                 "created_at": datetime.fromisoformat(parsed_at) if parsed_at else None,
                 "site_name": site_name,
-                "site_emoji": emoji_by_name.get(site_name),
+                "site_emoji": None,
             })
             lid += 1
     return out

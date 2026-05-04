@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% block title %}Домены — Парсер{% endblock %}
+{% block content %}
+<h1>Домены</h1>
+<p>Всего: {{ domains_count }}. Сортировка по числу статей. Кликни по эмодзи чтобы изменить — оно ставится перед заголовком в Telegram-сообщениях.</p>
+
+<table>
+    <thead>
+        <tr>
+            <th>Эмодзи</th>
+            <th>Домен</th>
+            <th>Статей</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for d in domains %}
+        <tr data-id="{{ d.id }}">
+            <td>
+                <button type="button" class="emoji-cell" onclick="openEmojiPicker({{ d.id }})">
+                    {{ d.emoji or '🌐' }}
+                </button>
+            </td>
+            <td>
+                <img src="/favicon/{{ d.name }}" alt="" width="18" height="18" class="favicon" loading="lazy"
+                     onerror="this.style.display='none'">
+                <strong>{{ d.name }}</strong>
+            </td>
+            <td>{{ d.articles_count }}</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+
+<!-- Emoji picker (общий) -->
+<div id="emojiModal" class="emoji-modal" style="display:none;">
+    <div class="emoji-modal__backdrop" onclick="closeEmojiModal()"></div>
+    <div class="emoji-modal__card">
+        <h3>Выбери эмодзи для домена</h3>
+        <p class="emoji-modal__hint">Подставится перед заголовком статьи в Telegram. Если в наборе нет — введи свой.</p>
+        <div class="emoji-modal__current" id="emojiCurrent" style="display:none;">
+            Текущий: <span id="emojiCurrentValue"></span>
+        </div>
+        <div class="emoji-grid" id="emojiGrid"></div>
+        <div class="emoji-modal__custom">
+            <input type="text" id="emojiCustomInput" placeholder="🎯 свой эмодзи" maxlength="10">
+            <button type="button" class="btn-green" onclick="applyCustomEmoji()">Применить</button>
+        </div>
+        <div class="emoji-modal__actions">
+            <button type="button" class="btn-grey" onclick="setEmojiForDomain('🌐')">По умолчанию (🌐)</button>
+            <button type="button" class="btn-grey" onclick="closeEmojiModal()">Отмена</button>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/domains.js') }}"></script>
+{% endblock %}

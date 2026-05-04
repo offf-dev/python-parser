@@ -43,10 +43,7 @@ def list_links():
             rows = session.execute(text(f"""
                 SELECT l.id, l.title, l.url, l.is_send, l.created_at,
                        COALESCE(d.name, '—') as site_name,
-                       (SELECT s.emoji FROM sites s
-                        WHERE s.emoji IS NOT NULL
-                          AND SUBSTRING_INDEX(s.site_key, '/', 1) = d.name
-                        LIMIT 1) as site_emoji
+                       d.emoji as site_emoji
                 FROM links l
                 LEFT JOIN domains d ON l.domain_id = d.id
                 {where}

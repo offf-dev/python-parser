@@ -42,9 +42,9 @@ async def send_oldest_unsent_article():
             if config.USE_DB_FOR_ARTICLES and storage.SessionLocal:
                 with storage.SessionLocal() as session:
                     article = session.execute(text("""
-                        SELECT l.id, l.title, l.url, l.created_at, s.emoji
+                        SELECT l.id, l.title, l.url, l.created_at, d.emoji
                         FROM links l
-                        LEFT JOIN sites s ON l.site_id = s.id
+                        LEFT JOIN domains d ON l.domain_id = d.id
                         WHERE l.is_send = 0
                         ORDER BY l.created_at ASC, l.id ASC
                         LIMIT 1

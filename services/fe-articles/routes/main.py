@@ -87,7 +87,6 @@ def index():
             "title_selector": request.form["title_selector"].strip(),
             "link_selector": request.form["link_selector"].strip(),
             "active": resource.get("active", False),
-            "emoji": (request.form.get("emoji") or "").strip() or None,
         }
 
         if action == "save":
@@ -117,7 +116,6 @@ def index():
                                     title_selector = :title_selector,
                                     url_selector = :url_selector,
                                     domain_id = :domain_id,
-                                    emoji = :emoji,
                                     updated_at = NOW()
                                 WHERE id = :id
                             """), {
@@ -126,23 +124,21 @@ def index():
                                 "title_selector": current["title_selector"],
                                 "url_selector": current["link_selector"],
                                 "domain_id": domain_id, "id": link_id_form,
-                                "emoji": current["emoji"],
                             })
                             success = f"Сайт обновлён: {current['name']}"
                         else:
                             session.execute(text("""
                                 INSERT INTO sites
                                 (site_key, site_url, articles_selector, title_selector, url_selector,
-                                 domain_id, active, emoji, created_at, updated_at)
+                                 domain_id, active, created_at, updated_at)
                                 VALUES (:site_key, :site_url, :articles_selector, :title_selector,
-                                        :url_selector, :domain_id, 0, :emoji, NOW(), NOW())
+                                        :url_selector, :domain_id, 0, NOW(), NOW())
                             """), {
                                 "site_key": current["name"], "site_url": current["url"],
                                 "articles_selector": current["item_selector"],
                                 "title_selector": current["title_selector"],
                                 "url_selector": current["link_selector"],
                                 "domain_id": domain_id,
-                                "emoji": current["emoji"],
                             })
                             success = f"Сайт добавлен: {current['name']}"
                         session.commit()
