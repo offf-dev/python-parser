@@ -173,3 +173,63 @@ git status
 git pull origin main
 docker compose up -d --build SERVISE_NAME
 ```
+
+---
+
+# Локальные режимы работы fe-articles
+
+База данных и Telegram-каналы у локалки и стейджа **общие** (Cityhost MySQL,
+тестовый канал). Разница — пишем мы из локалки или нет.
+
+## Read-only dev (по-умолчанию)
+
+UI читает из боевой БД, ничего не пишет. Парсер автоматически отключён.
+Удобно тестить новые фичи, ковыряться в шаблонах, играть с фильтрами —
+ничего не сломаешь.
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d fe-articles
+```
+
+UI: http://localhost:5000/
+
+## Local-write (для ручного парсинга)
+
+Используется для сайтов, которые не парсятся со стейджа (Cloudflare и
+прочая бот-защита) — у домашнего IP их обычно пропускает.
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.dev.yml -f docker-compose.write.yml up -d fe-articles
+```
+
+После подъёма — выбери ID нужного сайта на `/sites` и запусти точечный
+парсинг (active-флаг игнорируется, парсит даже выключенные источники):
+
+```bash
+# один сайт:
+docker exec python-parser-fe-articles-1 python run_once.py 150
+
+# несколько разом:
+docker exec python-parser-fe-articles-1 python run_once.py 150 165 168
+```
+
+Скрипт прогоняет: parse_resource → English/blacklist/blocked-keywords
+фильтры → URL-нормализация → дедуп против всех существующих `links` →
+INSERT новых в БД. Прод-сервер дальше по своему trickle-расписанию
+(каждые 3 мин) подхватит и отправит в канал.
+
+После сессии — обратно в read-only:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d fe-articles
+```
+
+## Когда НЕ надо local-write
+
+- Что-либо тестируешь и не хочешь чтобы случайные данные улетели в БД
+- Делаешь refactor / правишь UI / пробуешь новый CSS
+- Не уверен что код правильный
+
+В обычной разработке всегда `dev` (read-only). `write` — только для
+запланированной ручной заливки данных.
+
