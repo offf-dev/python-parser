@@ -1,0 +1,27 @@
+# Локальный write-режим для ручного парсинга Cloudflare-protected сайтов и т.п.
+#
+# Используется поверх docker-compose.dev.yml:
+#
+#   docker compose -f docker-compose.yml \
+#                  -f docker-compose.dev.yml \
+#                  -f docker-compose.write.yml up -d fe-articles
+#
+# Что меняется относительно dev:
+# - READONLY_DB=false  → запись в Cityhost MySQL разрешена
+# - TG_BOT_TOKEN_FOR_ARTICLES/LOGS приходят из .env (не зануляются)
+#   → при ручном run_once.py статьи реально сохраняются в БД и попадают
+#     в trickle-очередь на проде; следующий обычный цикл прода отправит
+#     их в канал
+#
+# После сессии — обратно в обычный dev:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d fe-articles
+
+services:
+  fe-articles:
+    environment:
+      READONLY_DB: "false"
+      # Boты не нужны локально: pipeline всё равно сохраняет в БД, а trickle
+      # запустится на сервере. Если хочется чтобы локально тоже шли сообщения
+      # в канал — раскомментируй:
+      # TG_BOT_TOKEN_FOR_ARTICLES: "${TG_BOT_TOKEN_FOR_ARTICLES}"
+      # TG_CHAT_ID_FOR_ARTICLES:   "${TG_CHAT_ID_FOR_ARTICLES}"
