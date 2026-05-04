@@ -350,7 +350,10 @@ tbody tr:hover td { background: var(--surface-low); }
 .favicon {
     vertical-align: middle;
     margin-right: 8px;
-    border-radius: 3px;
+    background: #1d1b20;     /* тёмная подложка чтобы белые иконки не сливались с белым фоном */
+    border-radius: 4px;
+    padding: 1px;
+    box-sizing: content-box;
 }
 .cell-emoji {
     display: inline-block;
