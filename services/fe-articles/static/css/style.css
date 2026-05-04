@@ -347,6 +347,11 @@ td {
 tbody tr { transition: background 0.1s; }
 tbody tr:hover td { background: var(--surface-low); }
 
+.favicon {
+    vertical-align: middle;
+    margin-right: 8px;
+    border-radius: 3px;
+}
 td a { color: var(--primary); }
 td a:hover { color: var(--on-primary-container); text-decoration: underline; }
 td strong { color: var(--on-surface); font-weight: 600; }
@@ -535,6 +540,19 @@ pre {
     font-size: 13.5px;
     margin: 0 0 18px;
     line-height: 1.5;
+}
+.emoji-modal__current {
+    margin-bottom: 12px;
+    padding: 10px 14px;
+    background: var(--secondary-container);
+    color: var(--on-sec-container);
+    border-radius: var(--radius-sm);
+    font-size: 13px;
+}
+.emoji-modal__current span {
+    font-size: 22px;
+    margin-left: 8px;
+    vertical-align: middle;
 }
 .emoji-modal__custom {
     display: flex;

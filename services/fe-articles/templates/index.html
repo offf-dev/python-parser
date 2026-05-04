@@ -38,6 +38,9 @@
     <div class="emoji-modal__card">
         <h3>Выбери эмодзи для источника</h3>
         <p class="emoji-modal__hint">Будет использоваться перед заголовком статьи в Telegram. Если в наборе нет нужного — вставь свой в поле ниже.</p>
+        <div class="emoji-modal__current" id="emojiCurrent" style="display:none;">
+            Текущий: <span id="emojiCurrentValue"></span>
+        </div>
         <div class="emoji-grid" id="emojiGrid"></div>
         <div class="emoji-modal__custom">
             <input type="text" id="emojiCustomInput" placeholder="🎯 свой эмодзи" maxlength="10">

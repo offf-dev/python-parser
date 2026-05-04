@@ -83,6 +83,21 @@ function openEmojiModal() {
         const sel = em === current ? ' emoji-btn--selected' : '';
         return `<button type="button" class="emoji-btn${sel}" onclick="setEmojiAndSubmit('${em}')">${em}</button>`;
     }).join('');
+
+    // Показ "Текущий: X" если уже задан
+    const currentEl = document.getElementById('emojiCurrent');
+    const currentVal = document.getElementById('emojiCurrentValue');
+    if (current) {
+        currentVal.textContent = current;
+        currentEl.style.display = 'block';
+    } else {
+        currentEl.style.display = 'none';
+    }
+
+    // Пре-заполняем кастомное поле текущим (если он не из набора)
+    const customInput = document.getElementById('emojiCustomInput');
+    customInput.value = current && !EMOJIS.includes(current) ? current : '';
+
     document.getElementById('emojiModal').style.display = 'flex';
 }
 
