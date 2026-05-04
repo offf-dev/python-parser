@@ -384,8 +384,13 @@ def get_all_links():
             with SessionLocal() as session:
                 rows = session.execute(text("""
                     SELECT l.id, l.title, l.url, l.is_send, l.created_at,
-                           COALESCE(d.name, '—') as site_name
-                    FROM links l LEFT JOIN domains d ON l.domain_id = d.id
+                           COALESCE(d.name, '—') as site_name,
+                           (SELECT s.emoji FROM sites s
+                            WHERE s.emoji IS NOT NULL
+                              AND SUBSTRING_INDEX(s.site_key, '/', 1) = d.name
+                            LIMIT 1) as site_emoji
+                    FROM links l
+                    LEFT JOIN domains d ON l.domain_id = d.id
                     ORDER BY l.id DESC
                 """)).mappings().fetchall()
                 return [dict(r) for r in rows]
@@ -393,7 +398,9 @@ def get_all_links():
             logger.error(f"Ошибка get_all_links БД: {e}\n{traceback.format_exc()}")
             return []
 
+    # JSON-режим: маппим эмодзи из ресурсов
     last = load_last_results()
+    emoji_by_name = {r.get("name"): r.get("emoji") for r in load_resources()}
     out = []
     lid = 1
     for site_name, articles in last.items():
@@ -406,6 +413,7 @@ def get_all_links():
                 "is_send": art.get("is_send", False),
                 "created_at": datetime.fromisoformat(parsed_at) if parsed_at else None,
                 "site_name": site_name,
+                "site_emoji": emoji_by_name.get(site_name),
             })
             lid += 1
     return out

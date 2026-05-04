@@ -33,7 +33,7 @@
         <tr>
             <td>{{ link.id }}</td>
             <td class="cell-title"><a href="{{ link.url }}" target="_blank" rel="noopener">{{ link.title }}</a></td>
-            <td>{{ link.site_name or '—' }}</td>
+            <td>{% if link.site_emoji %}<span class="cell-emoji">{{ link.site_emoji }}</span>{% endif %}{{ link.site_name or '—' }}</td>
             <td>
                 <input type="checkbox" class="checkbox" {{ 'checked' if link.is_send else '' }}
                        onchange="toggleLink('{{ link.url | replace("'", "\\'") }}', this.checked)">
