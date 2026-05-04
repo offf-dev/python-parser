@@ -379,6 +379,10 @@ td.cell-title {
     overflow: hidden;
     text-overflow: ellipsis;
 }
+td.cell-site-key {
+    word-break: break-all;
+    max-width: 280px;
+}
 
 /* M3 Switch-style чекбокс */
 .checkbox {

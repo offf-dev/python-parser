@@ -6,6 +6,7 @@ services:
     volumes:
       - ./services/fe-articles/data:/app/data
       - ./services/fe-articles/logs:/app/logs
+      - ./services/fe-articles/static/icons:/app/static/icons
     env_file:
       - ./services/fe-articles/.env
     restart: unless-stopped
