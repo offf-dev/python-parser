@@ -161,6 +161,10 @@ def extract_articles(html: str, item_selector: str, title_selector: str,
         if not link.startswith("http"):
             continue
 
+        if filters.is_blacklisted_url(link):
+            logger.info(f"  ✗ blacklisted URL: {link}")
+            continue
+
         with warnings.catch_warnings(record=True):
             clean_title = BeautifulSoup(title, "lxml").get_text(strip=True)
         if not clean_title:

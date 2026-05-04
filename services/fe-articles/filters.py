@@ -14,6 +14,15 @@ import re
 # Длинное число — отсекает шум вроде ID в URL/заголовке (5+ цифр подряд).
 _LONG_NUM_RE = re.compile(r"\b\d{5,}\b")
 
+# URL-паттерны заведомо «не статья». Совпадение → отбрасываем до сохранения.
+_URL_BLACKLIST = [
+    re.compile(r"(?i)://(?:www\.)?linkedin\.com/in/"),  # профили, не статьи
+]
+
+
+def is_blacklisted_url(url: str) -> bool:
+    return any(p.search(url or "") for p in _URL_BLACKLIST)
+
 # Эмодзи и спец-блоки Unicode, которые ломают ASCII-проверку
 # (см. cleanStr в Laravel-парсере).
 _EMOJI_RE = re.compile(

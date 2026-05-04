@@ -26,11 +26,28 @@ _BRAILLE_BLANK = "⠀"
 _ZWSP = "​"
 DEFAULT_EMOJI = "📰"
 
+# Хосты, для которых Telegram надёжно НЕ отдаёт preview-карточку
+# (страница за login-wall, OG-метатеги недоступны бот-агенту, etc).
+# Для таких — делаем тайтл кликабельной ссылкой, чтобы пользователь
+# мог хоть как-то перейти.
+_NO_PREVIEW_DOMAINS = {
+    "linkedin.com",  # посты/pulse — preview не появляется
+}
+
+
+def _has_preview(url: str) -> bool:
+    from storage import extract_domain
+    return extract_domain(url) not in _NO_PREVIEW_DOMAINS
+
 
 def format_article(title: str, url: str, emoji: str = None) -> str:
     """Форматирует одну статью в TG-сообщение."""
     e = emoji or DEFAULT_EMOJI
-    return f'{e} <b>{title}</b><a href="{url}">{_ZWSP}</a>'
+    if _has_preview(url):
+        # Скрытая ссылка — Telegram сам нарисует preview-карточку под сообщением
+        return f'{e} <b>{title}</b><a href="{url}">{_ZWSP}</a>'
+    # Превью гарантированно не будет → делаем тайтл кликабельным
+    return f'{e} <b><a href="{url}">{title}</a></b>'
 
 _articles_app = None
 _articles_bot = None

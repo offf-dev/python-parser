@@ -79,7 +79,7 @@ def ensure_schema():
         return
     try:
         with SessionLocal() as session:
-            # 1) domains.emoji — добавить если нет, инициализировать всех на 🌐
+            # 1) domains.emoji — добавить если нет / привести к utf8mb4 если уже есть
             d_emoji = session.execute(text("""
                 SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
                 WHERE TABLE_SCHEMA = DATABASE()
@@ -87,14 +87,27 @@ def ensure_schema():
                   AND COLUMN_NAME = 'emoji'
             """)).scalar()
             if not d_emoji:
-                logger.info("Migrating: ALTER TABLE domains ADD COLUMN emoji")
+                logger.info("Migrating: ALTER TABLE domains ADD COLUMN emoji (utf8mb4)")
                 session.execute(text(
-                    "ALTER TABLE domains ADD COLUMN emoji VARCHAR(10) NULL"
+                    "ALTER TABLE domains ADD COLUMN emoji VARCHAR(10) "
+                    "CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL"
                 ))
-                session.execute(text(
-                    "UPDATE domains SET emoji = :e WHERE emoji IS NULL"
-                ), {"e": DEFAULT_DOMAIN_EMOJI})
                 session.commit()
+
+            # Принудительно гарантируем utf8mb4 на колонке (если уже есть, но в utf8mb3
+            # — это идемпотентно превратит её в utf8mb4). Без этого 4-байтные эмодзи
+            # типа 🌐 при INSERT превращаются в '?'.
+            session.execute(text(
+                "ALTER TABLE domains MODIFY COLUMN emoji VARCHAR(10) "
+                "CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL"
+            ))
+            session.commit()
+
+            # Инициализация / починка повреждённых значений на 🌐
+            session.execute(text(
+                "UPDATE domains SET emoji = :e WHERE emoji IS NULL OR emoji = '' OR emoji = '?'"
+            ), {"e": DEFAULT_DOMAIN_EMOJI})
+            session.commit()
 
             # 2) sites.emoji — удалить если ещё есть (старая схема, теперь не используется)
             s_emoji = session.execute(text("""
