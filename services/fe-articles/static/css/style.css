@@ -366,16 +366,21 @@ tbody tr:hover td { background: var(--surface-low); }
     vertical-align: middle;
 }
 .emoji-cell {
+    width: 44px;
+    height: 44px;
     background: var(--surface-mid);
     border: none;
-    border-radius: var(--radius-sm);
-    padding: 6px 12px;
+    border-radius: 50%;
+    padding: 0;
     font-size: 22px;
     line-height: 1;
     cursor: pointer;
-    transition: background 0.1s;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    transition: background 0.1s, transform 0.1s;
 }
-.emoji-cell:hover { background: var(--surface-highest); }
+.emoji-cell:hover { background: var(--surface-highest); transform: scale(1.05); }
 td a { color: var(--primary); }
 td a:hover { color: var(--on-primary-container); text-decoration: underline; }
 td strong { color: var(--on-surface); font-weight: 600; }
