@@ -53,11 +53,13 @@ _articles_app = None
 _articles_bot = None
 _logs_app = None
 _logs_bot = None
+_summary_app = None
+_summary_bot = None
 
 
 async def init_bots():
-    """Поднять оба бота если включены. Вызывать ОДИН раз из async-контекста."""
-    global _articles_app, _articles_bot, _logs_app, _logs_bot
+    """Поднять боты если включены. Вызывать ОДИН раз из async-контекста."""
+    global _articles_app, _articles_bot, _logs_app, _logs_bot, _summary_app, _summary_bot
 
     if config.ARTICLES_BOT_ENABLED:
         try:
@@ -78,6 +80,18 @@ async def init_bots():
             await _logs_app.start()
         except Exception as e:
             logger.error(f"Ошибка инициализации logs-бота: {e}")
+
+    # Отдельный summary-бот: если задан TG_BOT_TOKEN_FOR_SUMMARY и он отличается
+    # от articles-бота — поднимаем как отдельный Application.
+    if config.TELEGRAM_TOKEN_SUMMARY and config.TELEGRAM_TOKEN_SUMMARY != config.TELEGRAM_TOKEN_ARTICLES:
+        try:
+            logger.info("Инициализация summary-бота...")
+            _summary_app = ApplicationBuilder().token(config.TELEGRAM_TOKEN_SUMMARY).build()
+            _summary_bot = _summary_app.bot
+            await _summary_app.initialize()
+            await _summary_app.start()
+        except Exception as e:
+            logger.error(f"Ошибка инициализации summary-бота: {e}")
 
 
 async def send_articles(text: str, preview: bool = True):
@@ -102,16 +116,18 @@ async def send_articles(text: str, preview: bool = True):
 
 async def send_summary(text: str):
     """Шлёт сводку цикла парсинга / стартовое сообщение в summary-канал.
-    No-op если ENABLE_PARSE_SUMMARY=false или articles-бот не поднят.
+    Использует отдельный summary-бот если задан, иначе articles-бот.
+    No-op если ENABLE_PARSE_SUMMARY=false.
     """
     if not config.ENABLE_PARSE_SUMMARY:
         logger.info(f"[TG-summary OFF by env] would send: {text[:120]}")
         return
-    if not _articles_bot or not config.TELEGRAM_CHANNEL_ID_SUMMARY:
+    bot_to_use = _summary_bot or _articles_bot
+    if not bot_to_use or not config.TELEGRAM_CHANNEL_ID_SUMMARY:
         logger.info(f"[TG-summary OFF] would send: {text[:120]}")
         return
     try:
-        await _articles_bot.send_message(
+        await bot_to_use.send_message(
             chat_id=config.TELEGRAM_CHANNEL_ID_SUMMARY,
             text=text, parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,

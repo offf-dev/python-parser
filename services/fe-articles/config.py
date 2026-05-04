@@ -24,6 +24,10 @@ TELEGRAM_CHANNEL_ID_LOGS = _int_or_none("TG_CHAT_ID_FOR_LOGS")
 # Если не задано — fallback на articles-канал. Удобно: при переезде articles
 # на боевой канал, summary можно оставить на тестовом, потом совсем выключить.
 TELEGRAM_CHANNEL_ID_SUMMARY = _int_or_none("TG_CHAT_ID_FOR_SUMMARY") or TELEGRAM_CHANNEL_ID_ARTICLES
+# Отдельный бот для summary — нужен когда summary-канал недоступен articles-боту
+# (например, articles-бот это прод-бот без прав в тестовом-summary канале).
+# Если не задан — summary использует articles-бот.
+TELEGRAM_TOKEN_SUMMARY = os.getenv("TG_BOT_TOKEN_FOR_SUMMARY") or None
 ENABLE_PARSE_SUMMARY = os.getenv("ENABLE_PARSE_SUMMARY", "true").lower() not in ("false", "0", "no")
 
 ARTICLES_BOT_ENABLED = bool(TELEGRAM_TOKEN_ARTICLES and TELEGRAM_CHANNEL_ID_ARTICLES)
