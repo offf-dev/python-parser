@@ -21,7 +21,8 @@
                 </button>
             </td>
             <td>
-                <img src="/favicon/{{ d.name }}" alt="" width="18" height="18" class="favicon" loading="lazy">
+                <img src="/favicon/{{ d.name }}" data-domain="{{ d.name }}"
+                     alt="" width="18" height="18" class="favicon" loading="lazy">
                 <strong>{{ d.name }}</strong>
             </td>
             <td>{{ d.articles_count }}</td>

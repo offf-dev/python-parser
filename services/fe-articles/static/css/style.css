@@ -350,9 +350,13 @@ tbody tr:hover td { background: var(--surface-low); }
 .favicon {
     vertical-align: middle;
     margin-right: 8px;
-    background: #1d1b20;     /* тёмная подложка чтобы белые иконки не сливались с белым фоном */
-    border-radius: 4px;
+    border-radius: 3px;
+}
+/* Точечно — для доменов с белой иконкой */
+.favicon[data-domain="css-weekly.com"] {
+    background: #1d1b20;
     padding: 1px;
+    border-radius: 4px;
     box-sizing: content-box;
 }
 .cell-emoji {

@@ -35,6 +35,7 @@
             <td>{{ site.id }}</td>
             <td class="cell-site-key">
                 <img src="/favicon/{{ site.site_key.split('/')[0] }}"
+                     data-domain="{{ site.site_key.split('/')[0] }}"
                      alt="" width="18" height="18" class="favicon" loading="lazy">
                 <strong>{{ site.site_key }}</strong>
             </td>
