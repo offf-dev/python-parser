@@ -125,9 +125,13 @@ def configure_jobs():
 
 
 async def send_startup_message():
-    await bot.send_summary(
+    msg = (
         "<b>Парсер запущен</b>\n\n"
         f"• Парсинг — каждые {config.PARSER_INTERVAL_MINUTES} мин\n"
         f"• Trickle-отправка — каждые {config.SENDER_INTERVAL_MINUTES} мин\n\n"
         "Первый парсинг через 30 секунд."
     )
+    # В summary-канал — операционный апдейт
+    await bot.send_summary(msg)
+    # В logs-чат — на случай если контейнер ожил после watchdog-кика, чтобы было видно
+    await bot.send_log("✅ " + msg)

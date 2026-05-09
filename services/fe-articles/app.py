@@ -17,6 +17,7 @@ import bot
 import config
 import scheduler as sched
 import storage
+import watchdog as wd
 from logging_setup import setup_logging
 from routes import register_blueprints
 
@@ -93,4 +94,7 @@ if __name__ == "__main__":
         app.run(host="0.0.0.0", port=config.PORT, debug=True, use_reloader=True)
     else:
         logger.info("=== PROD: Hypercorn + Async Scheduler ===")
+        # Watchdog-поток запускаем только в проде. В dev (Flask reloader)
+        # он бы дрался с автоперезапуском при изменении файлов.
+        wd.start()
         asyncio.run(_main_prod())
