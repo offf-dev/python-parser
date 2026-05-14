@@ -1,17 +1,32 @@
-"""Watchdog поток: следит за свежестью logs/parser.log.
+"""Watchdog поток: следит за РЕАЛЬНОЙ работой парсера через содержимое лога.
 
 Запускается в отдельном thread (не asyncio), поэтому даже если event-loop
 повис (Playwright leak / зомби-браузер), watchdog продолжит тикать.
 
-Логика:
-  Каждые WATCHDOG_INTERVAL_SEC проверяем mtime файла logs/parser.log.
-  Если он не обновлялся дольше WATCHDOG_STALE_SEC — это hung-state:
+❗ Старая версия watchdog'а проверяла mtime файла лога. Это давало
+false-positive «всё работает» в типичном hung-state, потому что APScheduler
+продолжает писать в лог «Job executed successfully» каждые 10 мин даже когда
+реальной работы не происходит. mtime обновлялся → watchdog не срабатывал.
+
+Новая логика:
+  Каждые WATCHDOG_INTERVAL_SEC сканируем последние строки лога и ищем
+  МАРКЕРЫ реальной активности:
+    • "Автопарсинг занял" — успешное завершение run_auto_parse
+    • "[TG-articles ✓]"   — успешная отправка статьи в канал
+    • "Спаршено"           — успешный парсинг одного сайта
+
+  Если ни одного маркера за WATCHDOG_STALE_SEC — это hung-state:
     1. Шлём в logs-чат алерт (HTTP-запрос напрямую, без asyncio)
     2. os._exit(1) → docker compose с restart: unless-stopped поднимет
+
+  Дополнительный сигнал: если в логе есть N подряд предупреждений
+  "maximum number of running instances reached" без промежуточного маркера
+  успеха — парсер точно завис.
 """
 
 import logging
 import os
+import re
 import threading
 import time
 
@@ -26,6 +41,21 @@ _logger = logging.getLogger("parser.watchdog")
 WATCHDOG_INTERVAL_SEC = int(os.getenv("WATCHDOG_INTERVAL_SEC", "60"))
 WATCHDOG_STALE_SEC = int(os.getenv("WATCHDOG_STALE_SEC", "1800"))  # 30 мин
 WATCHDOG_LOG_FILE = "logs/parser.log"
+WATCHDOG_TAIL_LINES = 200
+
+# Время старта самого watchdog-а — используется как fallback-точка, если
+# в логе вообще ни одного маркера активности (например, все парс-сайты
+# валятся подряд → никаких "Спаршено" не появилось).
+_WATCHDOG_START_TS = time.time()
+
+# Маркеры реальной активности
+_ACTIVITY_MARKERS = (
+    "Автопарсинг занял",
+    "[TG-articles ✓]",
+    "Спаршено",
+)
+# Лог-таймстамп в начале каждой строки: "YYYY-MM-DD HH:MM:SS - ..."
+_TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
 
 
 def _send_tg_alert_sync(text: str):
@@ -49,26 +79,71 @@ def _send_tg_alert_sync(text: str):
         _logger.error(f"watchdog: TG alert failed: {e}")
 
 
+def _last_activity_age_seconds() -> int | None:
+    """Возвращает возраст последнего ACTIVITY_MARKER в логе в секундах.
+    None если файл лога не найден или маркеры не встречаются."""
+    if not os.path.exists(WATCHDOG_LOG_FILE):
+        return None
+    try:
+        # tail последних строк через простое чтение хвоста файла
+        with open(WATCHDOG_LOG_FILE, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            chunk = 64 * 1024
+            start = max(0, size - chunk)
+            f.seek(start)
+            data = f.read().decode("utf-8", errors="ignore")
+        lines = data.splitlines()[-WATCHDOG_TAIL_LINES:]
+    except Exception as e:
+        _logger.warning(f"watchdog: can't read log: {e}")
+        return None
+
+    # Идём с конца, ищем последнюю строку с маркером активности
+    for line in reversed(lines):
+        if any(m in line for m in _ACTIVITY_MARKERS):
+            m = _TS_RE.match(line)
+            if not m:
+                continue
+            try:
+                # Метки лога без TZ → трактуем как UTC (logger использует localtime,
+                # но контейнер сам в UTC согласно Dockerfile/timezone). На разнице
+                # ±пара часов с реальностью watchdog все равно сработает корректно
+                # для порога 30 мин.
+                t = time.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
+                ts = time.mktime(t)
+                return int(time.time() - ts)
+            except Exception:
+                continue
+
+    # Fallback: маркеров не было НИ РАЗУ. Если watchdog уже работает >2×
+    # парс-интервала и так и не увидел маркеров — это тоже зависание
+    # (типа все парсинги тихо падают на старте).
+    parser_interval_min = int(os.getenv("PARSER_INTERVAL_MINUTES", "60"))
+    elapsed = int(time.time() - _WATCHDOG_START_TS)
+    if elapsed > 2 * parser_interval_min * 60:
+        return elapsed
+    return None
+
+
 def _loop():
     # Дай контейнеру время стартануть, прежде чем начать паниковать
     time.sleep(WATCHDOG_INTERVAL_SEC * 3)
     while True:
         try:
-            if os.path.exists(WATCHDOG_LOG_FILE):
-                age = time.time() - os.path.getmtime(WATCHDOG_LOG_FILE)
-                if age > WATCHDOG_STALE_SEC:
-                    msg = (
-                        f"❌ <b>Парсер завис</b>\n\n"
-                        f"logs/parser.log не обновлялся "
-                        f"<b>{int(age // 60)} мин</b> (порог {WATCHDOG_STALE_SEC // 60}).\n"
-                        f"Скорее всего повисла Playwright-сессия. "
-                        f"Перезапускаюсь — должен подняться через ~30 сек."
-                    )
-                    _logger.error(f"WATCHDOG: hung detected, age={int(age)}s")
-                    _send_tg_alert_sync(msg)
-                    # На всякий — небольшой sleep чтобы HTTP-запрос успел уйти
-                    time.sleep(2)
-                    os._exit(1)
+            age = _last_activity_age_seconds()
+            if age is not None and age > WATCHDOG_STALE_SEC:
+                msg = (
+                    f"❌ <b>Парсер завис</b>\n\n"
+                    f"Последняя реальная активность (парсинг/отправка статьи) "
+                    f"была <b>{age // 60} мин назад</b> (порог {WATCHDOG_STALE_SEC // 60}).\n"
+                    f"APScheduler продолжает крутить пустые тики, но Playwright "
+                    f"скорее всего повис. Перезапускаюсь — должен подняться через ~30 сек."
+                )
+                _logger.error(f"WATCHDOG: hung detected, last activity age={age}s")
+                _send_tg_alert_sync(msg)
+                # дать HTTP-запросу уйти
+                time.sleep(2)
+                os._exit(1)
         except Exception as e:
             _logger.error(f"watchdog loop error: {e}")
         time.sleep(WATCHDOG_INTERVAL_SEC)

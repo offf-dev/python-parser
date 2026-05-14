@@ -1,6 +1,7 @@
 """Парсер: Playwright fetch → BS4 extract (с фильтрами + URL-нормализацией) → orchestrator."""
 
 import asyncio
+import os
 import random
 import time
 import traceback
@@ -249,9 +250,16 @@ async def parse_resource(resource: dict, limit: int = None, blocked_keywords: li
         blocked_keywords = storage.load_blocked_keywords()
     try:
         logger.info(f"Парсим: {resource['name']} → {resource['url']}")
-        html = await fetch_html(
-            resource["url"],
-            wait_for_selector=resource.get("item_selector"),
+        # Жёсткий потолок на один сайт — 5 мин. Если Playwright повис на этом
+        # ресурсе, asyncio.wait_for прервёт его и парсинг пойдёт к следующему,
+        # а не заблокирует event-loop на час.
+        site_timeout = int(os.getenv("PARSE_SITE_TIMEOUT_SEC", "300"))
+        html = await asyncio.wait_for(
+            fetch_html(
+                resource["url"],
+                wait_for_selector=resource.get("item_selector"),
+            ),
+            timeout=site_timeout,
         )
         logger.info(f"HTML длина: {len(html)}")
 
