@@ -39,7 +39,15 @@ _logger = logging.getLogger("parser.watchdog")
 
 # Дефолты можно переопределять через env
 WATCHDOG_INTERVAL_SEC = int(os.getenv("WATCHDOG_INTERVAL_SEC", "60"))
-WATCHDOG_STALE_SEC = int(os.getenv("WATCHDOG_STALE_SEC", "1800"))  # 30 мин
+
+# Порог должен быть БОЛЬШЕ чем парс-интервал, иначе watchdog ловит
+# нормальную тишину между циклами как «зависание». Берём 2× от парса
+# с минимумом 30 мин — это даёт grace для одного пропущенного цикла +
+# запас на затяжной парсинг (~3 мин на 30 сайтов).
+_PARSER_INTERVAL_SEC = int(os.getenv("PARSER_INTERVAL_MINUTES", "60")) * 60
+_DEFAULT_STALE_SEC = max(1800, _PARSER_INTERVAL_SEC * 2)
+WATCHDOG_STALE_SEC = int(os.getenv("WATCHDOG_STALE_SEC", str(_DEFAULT_STALE_SEC)))
+
 WATCHDOG_LOG_FILE = "logs/parser.log"
 WATCHDOG_TAIL_LINES = 200
 
@@ -158,5 +166,6 @@ def start():
     t.start()
     _logger.info(
         f"watchdog запущен: проверка каждые {WATCHDOG_INTERVAL_SEC}с, "
-        f"порог {WATCHDOG_STALE_SEC}с"
+        f"порог {WATCHDOG_STALE_SEC}с (={WATCHDOG_STALE_SEC // 60} мин), "
+        f"парс-интервал {_PARSER_INTERVAL_SEC // 60} мин"
     )
