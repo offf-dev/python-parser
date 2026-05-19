@@ -14,6 +14,46 @@ import re
 # Длинное число — отсекает шум вроде ID в URL/заголовке (5+ цифр подряд).
 _LONG_NUM_RE = re.compile(r"\b\d{5,}\b")
 
+# Любой символ из НЕ-латинских письменностей. Один такой в title — это уже
+# не чисто английский, режем без участия langdetect (он часто ловится на
+# доминирующих английских словах в смешанных заголовках, например
+# "Async Bugs（IV）：Derived State 為什麼會漂移" → en:1.00).
+_NON_LATIN_SCRIPT_RE = re.compile(
+    "["
+    "Ͱ-Ͽ"   # Greek
+    "Ѐ-ӿ"   # Cyrillic
+    "Ԁ-ԯ"   # Cyrillic Supplement
+    "֐-׿"   # Hebrew
+    "؀-ۿ"   # Arabic
+    "܀-ݏ"   # Syriac
+    "ऀ-ॿ"   # Devanagari
+    "ঀ-৿"   # Bengali
+    "਀-੿"   # Gurmukhi
+    "઀-૿"   # Gujarati
+    "଀-୿"   # Oriya
+    "஀-௿"   # Tamil
+    "ఀ-౿"   # Telugu
+    "ಀ-೿"   # Kannada
+    "ഀ-ൿ"   # Malayalam
+    "฀-๿"   # Thai
+    "຀-໿"   # Lao
+    "ༀ-࿿"   # Tibetan
+    "က-႟"   # Myanmar
+    "Ⴀ-ჿ"   # Georgian
+    "ᄀ-ᇿ"   # Hangul Jamo
+    "぀-ゟ"   # Hiragana
+    "゠-ヿ"   # Katakana
+    "㐀-䶿"   # CJK Extension A
+    "一-鿿"   # CJK Unified Ideographs
+    "ꀀ-꓏"   # Yi Syllables
+    "가-힯"   # Hangul Syllables
+    "]"
+)
+
+
+def _has_non_latin_script(text: str) -> bool:
+    return bool(text and _NON_LATIN_SCRIPT_RE.search(text))
+
 # URL-паттерны заведомо «не статья». Совпадение → отбрасываем до сохранения.
 _URL_BLACKLIST = [
     re.compile(r"(?i)://(?:www\.)?linkedin\.com/in/"),  # профили, не статьи
@@ -91,6 +131,14 @@ def is_english(title: str) -> bool:
     из CJK/кириллицы, что мы режем.
     """
     if not title:
+        return False
+
+    # Жёсткая проверка: если в строке есть хоть один НЕ-латинский символ
+    # (кириллица, CJK, арабский, индийские, греческий, грузинский и т.д.) —
+    # это уже не чисто английский. Защита от смешанных заголовков типа
+    # 'Async Bugs（IV）：Derived State 為什麼會漂移', где langdetect видит
+    # доминирующие английские слова и ставит en:1.00.
+    if _has_non_latin_script(title):
         return False
 
     detect_input = _EMOJI_RE.sub("", title).strip()
