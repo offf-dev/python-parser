@@ -9,6 +9,14 @@ services:
       - ./services/fe-articles/static/icons:/app/static/icons
     env_file:
       - ./services/fe-articles/.env
+    # PID 1 = tini → reaps zombie chrome-headless процессы, которые Playwright
+    # оставляет при неудачном browser.close(). Без этого они копились до 900+
+    # за сутки и упирали процесс в kernel-limits (EAGAIN на pthread_create).
+    init: true
+    # Жёсткий потолок процессов в контейнере. Нормальный пик ~30-40 (python +
+    # один chromium со своим пулом воркеров). 256 даёт запас, но не позволяет
+    # утечке расти бесконтрольно — fail fast лучше чем тихая деградация.
+    pids_limit: 256
     restart: unless-stopped
 
   number-challenge:

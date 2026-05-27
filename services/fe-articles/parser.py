@@ -1,6 +1,7 @@
 """Парсер: Playwright fetch → BS4 extract (с фильтрами + URL-нормализацией) → orchestrator."""
 
 import asyncio
+import html as _html
 import os
 import random
 import time
@@ -93,51 +94,59 @@ async def fetch_html(url: str, *, headers=None, retries=None, timeout_ms=None,
                 "--disable-infobars", "--window-size=1920,1080",
             ],
         )
-        context = await browser.new_context(
-            extra_http_headers=headers,
-            user_agent=headers["User-Agent"],
-            viewport={"width": 1920, "height": 1080},
-        )
-        page = await context.new_page()
-        for script in _STEALTH_INIT:
-            await page.add_init_script(script)
+        # try/finally критичен: при cancel от asyncio.wait_for (site_timeout
+        # в parse_resource) или исключении в page.content() браузер обязан
+        # закрыться, иначе chromium-сабпроцесс остаётся сиротой → зомби под
+        # PID 1 → за сутки накапливалось 900+ процессов и ядро отказывало в
+        # pthread_create на следующих запусках.
+        try:
+            context = await browser.new_context(
+                extra_http_headers=headers,
+                user_agent=headers["User-Agent"],
+                viewport={"width": 1920, "height": 1080},
+            )
+            page = await context.new_page()
+            for script in _STEALTH_INIT:
+                await page.add_init_script(script)
 
-        last_err = None
-        for attempt in range(retries):
-            try:
-                await asyncio.sleep(random.uniform(1, 3))
-                await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-                if wait_for_selector:
-                    # Ждём конкретный селектор. Если не появится за 25с — попробуем
-                    # networkidle и фиксированный wait как fallback.
-                    try:
-                        await page.wait_for_selector(wait_for_selector, timeout=25000)
-                    except Exception:
-                        logger.warning(
-                            f"selector '{wait_for_selector}' never appeared on {url} — "
-                            f"fall back to networkidle"
-                        )
+            last_err = None
+            for attempt in range(retries):
+                try:
+                    await asyncio.sleep(random.uniform(1, 3))
+                    await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                    if wait_for_selector:
+                        # Ждём конкретный селектор. Если не появится за 25с — попробуем
+                        # networkidle и фиксированный wait как fallback.
                         try:
-                            await page.wait_for_load_state("networkidle", timeout=15000)
+                            await page.wait_for_selector(wait_for_selector, timeout=25000)
                         except Exception:
-                            pass
-                        await page.wait_for_timeout(3000)
-                else:
-                    try:
-                        await page.wait_for_load_state("networkidle", timeout=20000)
-                    except Exception:
-                        await page.wait_for_timeout(5000)
-                break
-            except Exception as e:
-                last_err = e
-                logger.warning(f"goto fail attempt {attempt + 1}/{retries} for {url}: {e}")
-        else:
-            await browser.close()
-            raise last_err
+                            logger.warning(
+                                f"selector '{wait_for_selector}' never appeared on {url} — "
+                                f"fall back to networkidle"
+                            )
+                            try:
+                                await page.wait_for_load_state("networkidle", timeout=15000)
+                            except Exception:
+                                pass
+                            await page.wait_for_timeout(3000)
+                    else:
+                        try:
+                            await page.wait_for_load_state("networkidle", timeout=20000)
+                        except Exception:
+                            await page.wait_for_timeout(5000)
+                    break
+                except Exception as e:
+                    last_err = e
+                    logger.warning(f"goto fail attempt {attempt + 1}/{retries} for {url}: {e}")
+            else:
+                raise last_err
 
-        html = await page.content()
-        await browser.close()
-        return html
+            return await page.content()
+        finally:
+            try:
+                await browser.close()
+            except Exception as e:
+                logger.warning(f"browser.close() raised (ignoring): {e}")
 
 
 async def get_page_html_for_debug(url: str) -> str:
@@ -147,19 +156,23 @@ async def get_page_html_for_debug(url: str) -> str:
             browser = await p.chromium.launch(
                 headless=True, args=["--no-sandbox", "--disable-setuid-sandbox"]
             )
-            context = await browser.new_context(extra_http_headers=_DEFAULT_HEADERS)
-            page = await context.new_page()
-            for attempt in range(2):
+            try:
+                context = await browser.new_context(extra_http_headers=_DEFAULT_HEADERS)
+                page = await context.new_page()
+                for attempt in range(2):
+                    try:
+                        await page.goto(url, wait_until="domcontentloaded", timeout=120_000)
+                        break
+                    except Exception as e:
+                        if attempt == 1:
+                            raise
+                        logger.warning(f"debug goto retry: {e}")
+                return await page.content()
+            finally:
                 try:
-                    await page.goto(url, wait_until="domcontentloaded", timeout=120_000)
-                    break
+                    await browser.close()
                 except Exception as e:
-                    if attempt == 1:
-                        raise
-                    logger.warning(f"debug goto retry: {e}")
-            html = await page.content()
-            await browser.close()
-        return html
+                    logger.warning(f"debug browser.close() raised (ignoring): {e}")
     except Exception as e:
         logger.error(f"ОШИБКА получения HTML для {url}: {e}")
         return f"Ошибка: {e}"
@@ -232,14 +245,20 @@ def extract_articles(html: str, item_selector: str, title_selector: str,
 
 
 def _admin_msg(resource: dict, problem: str) -> str:
-    """Формирует уведомление админу с доменом и всеми селекторами (docs/parser.md §4.4)."""
+    """Формирует уведомление админу с доменом и всеми селекторами (docs/parser.md §4.4).
+
+    HTML-escape всех динамических значений: Playwright кидает ошибки с
+    `<launching>...</launching>` и прочими тегоподобными вставками, которые
+    ломают TG parse_mode=HTML и алерт просто не доходит до logs-чата.
+    """
+    esc = _html.escape
     return (
-        f"❌ <b>{resource.get('name', 'unknown')}</b>\n"
-        f"{problem}\n\n"
-        f"URL: {resource.get('url', '?')}\n"
-        f"item:  <code>{resource.get('item_selector', '')}</code>\n"
-        f"title: <code>{resource.get('title_selector', '')}</code>\n"
-        f"link:  <code>{resource.get('link_selector', '')}</code>"
+        f"❌ <b>{esc(resource.get('name', 'unknown'))}</b>\n"
+        f"{esc(problem)}\n\n"
+        f"URL: {esc(resource.get('url', '?'))}\n"
+        f"item:  <code>{esc(resource.get('item_selector', ''))}</code>\n"
+        f"title: <code>{esc(resource.get('title_selector', ''))}</code>\n"
+        f"link:  <code>{esc(resource.get('link_selector', ''))}</code>"
     )
 
 

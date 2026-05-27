@@ -4,6 +4,9 @@
 поднять парсер локально без токенов.
 """
 
+import html as _html
+import re
+
 from telegram.constants import ParseMode
 from telegram.ext import ApplicationBuilder
 
@@ -94,6 +97,49 @@ async def init_bots():
             logger.error(f"Ошибка инициализации summary-бота: {e}")
 
 
+# TG поддерживает только ограниченный набор HTML-тэгов. Когда в текст ошибки
+# попадает что-то вроде Playwright-овского `<launching> chrome ...`, TG отвечает
+# `Can't parse entities: unsupported start tag` и сообщение НЕ доходит — это в
+# первую очередь убивало алерты watchdog'а.
+_TG_ALLOWED_TAGS = {
+    "b", "strong", "i", "em", "u", "ins", "s", "strike", "del",
+    "a", "code", "pre", "br", "tg-spoiler", "blockquote", "span",
+}
+_TAG_RE = re.compile(r"</?([a-zA-Z][a-zA-Z0-9-]*)\b[^<>]*>")
+
+
+def _sanitize_html_for_tg(text: str) -> str:
+    """Escape-ит любые тэги вне TG-белого списка; легальные <b>/<code>/<a> и
+    т.п. оставляет как есть. Голые `<` и `>` в строке (не часть тэга) трогать
+    не нужно — TG их не пытается распарсить."""
+    return _TAG_RE.sub(
+        lambda m: m.group(0) if m.group(1).lower() in _TG_ALLOWED_TAGS else _html.escape(m.group(0)),
+        text,
+    )
+
+
+async def _send_with_html_fallback(bot_obj, chat_id, text: str, **kwargs):
+    """send_message с HTML; при unsupported-tag ошибке — sanitize + retry,
+    иначе хотя бы plain-text fallback. Возвращает True при успехе."""
+    try:
+        await bot_obj.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML, **kwargs)
+        return True
+    except Exception as e:
+        if "parse entities" not in str(e).lower() and "unsupported" not in str(e).lower():
+            raise
+        logger.warning(f"TG HTML parse failed ({e}); retry with sanitized HTML")
+        try:
+            await bot_obj.send_message(
+                chat_id=chat_id, text=_sanitize_html_for_tg(text),
+                parse_mode=ParseMode.HTML, **kwargs,
+            )
+            return True
+        except Exception as e2:
+            logger.warning(f"sanitized retry failed ({e2}); fallback to plain text")
+            await bot_obj.send_message(chat_id=chat_id, text=text, **kwargs)
+            return True
+
+
 async def send_articles(text: str, preview: bool = True):
     """Шлёт в публичный канал. No-op если бот выключен.
     По умолчанию preview включён — статьи рендерятся как карточки с фавиконом.
@@ -102,9 +148,8 @@ async def send_articles(text: str, preview: bool = True):
         logger.info(f"[TG-articles OFF] would send: {text[:120]}...")
         return
     try:
-        await _articles_bot.send_message(
-            chat_id=config.TELEGRAM_CHANNEL_ID_ARTICLES,
-            text=text, parse_mode=ParseMode.HTML,
+        await _send_with_html_fallback(
+            _articles_bot, config.TELEGRAM_CHANNEL_ID_ARTICLES, text,
             disable_web_page_preview=not preview,
         )
         logger.info(f"[TG-articles ✓] sent: {text[:80]}")
@@ -127,9 +172,8 @@ async def send_summary(text: str):
         logger.info(f"[TG-summary OFF] would send: {text[:120]}")
         return
     try:
-        await bot_to_use.send_message(
-            chat_id=config.TELEGRAM_CHANNEL_ID_SUMMARY,
-            text=text, parse_mode=ParseMode.HTML,
+        await _send_with_html_fallback(
+            bot_to_use, config.TELEGRAM_CHANNEL_ID_SUMMARY, text,
             disable_web_page_preview=True,
         )
         logger.info(f"[TG-summary ✓] sent: {text[:80]}")
@@ -143,10 +187,10 @@ async def send_log(error_msg: str):
         logger.info(f"[TG-logs OFF] would log: {error_msg[:200]}")
         return
     try:
-        await _logs_bot.send_message(
-            chat_id=config.TELEGRAM_CHANNEL_ID_LOGS,
-            text=f"<b>🚨 Ошибка в парсере!</b>\n\n{error_msg}\n\nПроверьте логи для деталей.",
-            parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+        await _send_with_html_fallback(
+            _logs_bot, config.TELEGRAM_CHANNEL_ID_LOGS,
+            f"<b>🚨 Ошибка в парсере!</b>\n\n{error_msg}\n\nПроверьте логи для деталей.",
+            disable_web_page_preview=True,
         )
         logger.info(f"[TG-logs ✓] sent: {error_msg[:80]}")
     except Exception as e:

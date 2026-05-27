@@ -49,7 +49,13 @@ _DEFAULT_STALE_SEC = max(1800, _PARSER_INTERVAL_SEC * 2)
 WATCHDOG_STALE_SEC = int(os.getenv("WATCHDOG_STALE_SEC", str(_DEFAULT_STALE_SEC)))
 
 WATCHDOG_LOG_FILE = "logs/parser.log"
-WATCHDOG_TAIL_LINES = 200
+# Раньше было 200 строк / 64KB хвоста. Когда парсер залипал в Playwright и
+# логи распухали `<launching>` дампами на тысячи строк за минуты, маркеры
+# активности уползали из окна → fallback по elapsed-since-start рапортовал
+# дезинформирующий `age=78ч`. 4MB хвоста безопасно покрывает 10-12ч даже
+# тяжёлого error-спама.
+WATCHDOG_TAIL_BYTES = 4 * 1024 * 1024
+WATCHDOG_TAIL_LINES = 50_000
 
 # Время старта самого watchdog-а — используется как fallback-точка, если
 # в логе вообще ни одного маркера активности (например, все парс-сайты
@@ -87,18 +93,23 @@ def _send_tg_alert_sync(text: str):
         _logger.error(f"watchdog: TG alert failed: {e}")
 
 
-def _last_activity_age_seconds() -> int | None:
-    """Возвращает возраст последнего ACTIVITY_MARKER в логе в секундах.
-    None если файл лога не найден или маркеры не встречаются."""
+def _last_activity_age_seconds() -> tuple[int, str] | None:
+    """Возвращает (age_seconds, source) для последнего ACTIVITY_MARKER в логе.
+
+    `source` — 'log' если возраст из метки в логе, 'fallback' если из времени
+    старта watchdog'а (маркеров вообще нет в хвосте). Это даёт честный сигнал
+    в алерте — мы знаем, чтó именно мерили.
+
+    None если файл лога не найден или watchdog только что стартанул и маркеров
+    нет, но времени тоже прошло мало.
+    """
     if not os.path.exists(WATCHDOG_LOG_FILE):
         return None
     try:
-        # tail последних строк через простое чтение хвоста файла
         with open(WATCHDOG_LOG_FILE, "rb") as f:
             f.seek(0, 2)
             size = f.tell()
-            chunk = 64 * 1024
-            start = max(0, size - chunk)
+            start = max(0, size - WATCHDOG_TAIL_BYTES)
             f.seek(start)
             data = f.read().decode("utf-8", errors="ignore")
         lines = data.splitlines()[-WATCHDOG_TAIL_LINES:]
@@ -113,23 +124,21 @@ def _last_activity_age_seconds() -> int | None:
             if not m:
                 continue
             try:
-                # Метки лога без TZ → трактуем как UTC (logger использует localtime,
-                # но контейнер сам в UTC согласно Dockerfile/timezone). На разнице
-                # ±пара часов с реальностью watchdog все равно сработает корректно
-                # для порога 30 мин.
+                # Логгер пишет таймстампы в localtime контейнера. Контейнер
+                # в UTC по умолчанию; даже если TZ сдвинется, time.mktime
+                # тоже трактует struct как localtime → разница компенсируется.
                 t = time.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
                 ts = time.mktime(t)
-                return int(time.time() - ts)
+                return int(time.time() - ts), "log"
             except Exception:
                 continue
 
-    # Fallback: маркеров не было НИ РАЗУ. Если watchdog уже работает >2×
-    # парс-интервала и так и не увидел маркеров — это тоже зависание
-    # (типа все парсинги тихо падают на старте).
-    parser_interval_min = int(os.getenv("PARSER_INTERVAL_MINUTES", "60"))
+    # Fallback: маркеров в хвосте нет вообще. Если watchdog работает дольше
+    # порога — это либо всё рухнуло на старте, либо error-спам распух больше
+    # WATCHDOG_TAIL_BYTES. Считаем зависанием.
     elapsed = int(time.time() - _WATCHDOG_START_TS)
-    if elapsed > 2 * parser_interval_min * 60:
-        return elapsed
+    if elapsed > WATCHDOG_STALE_SEC:
+        return elapsed, "fallback"
     return None
 
 
@@ -138,16 +147,26 @@ def _loop():
     time.sleep(WATCHDOG_INTERVAL_SEC * 3)
     while True:
         try:
-            age = _last_activity_age_seconds()
-            if age is not None and age > WATCHDOG_STALE_SEC:
+            res = _last_activity_age_seconds()
+            if res is not None and res[0] > WATCHDOG_STALE_SEC:
+                age, source = res
+                if source == "log":
+                    detail = f"Последняя успешная активность <b>{age // 60} мин назад</b>"
+                else:
+                    detail = (
+                        f"В последних {WATCHDOG_TAIL_BYTES // 1024 // 1024}МБ лога "
+                        f"вообще нет маркеров успеха; watchdog работает уже "
+                        f"<b>{age // 60} мин</b> впустую"
+                    )
                 msg = (
                     f"❌ <b>Парсер завис</b>\n\n"
-                    f"Последняя реальная активность (парсинг/отправка статьи) "
-                    f"была <b>{age // 60} мин назад</b> (порог {WATCHDOG_STALE_SEC // 60}).\n"
+                    f"{detail} (порог {WATCHDOG_STALE_SEC // 60} мин).\n"
                     f"APScheduler продолжает крутить пустые тики, но Playwright "
                     f"скорее всего повис. Перезапускаюсь — должен подняться через ~30 сек."
                 )
-                _logger.error(f"WATCHDOG: hung detected, last activity age={age}s")
+                _logger.error(
+                    f"WATCHDOG: hung detected, age={age}s (source={source})"
+                )
                 _send_tg_alert_sync(msg)
                 # дать HTTP-запросу уйти
                 time.sleep(2)
