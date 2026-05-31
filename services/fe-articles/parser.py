@@ -14,6 +14,7 @@ from playwright.async_api import async_playwright
 import bot
 import config
 import filters
+import heartbeat
 import normalize
 import storage
 from logging_setup import get_logger
@@ -293,6 +294,7 @@ async def parse_resource(resource: dict, limit: int = None, blocked_keywords: li
             await bot.send_log(_admin_msg(resource, problem))
             return [], problem
         logger.info(f"Спаршено {len(data)} статей с {resource['name']}")
+        heartbeat.touch()
         return data, None
     except Exception as e:
         problem = f"сайт недоступен: {e}"
@@ -384,6 +386,7 @@ async def run_auto_parse():
             f"Автопарсинг занял {elapsed:.2f}с | "
             f"всего новых: {len(all_new)} | ошибок: {len(errors)}"
         )
+        heartbeat.touch()
 
         # Аудит: домены с дефолтным 🌐 и >5 статей → алерт в logs-чат раз в сутки
         await _audit_default_emoji_domains()

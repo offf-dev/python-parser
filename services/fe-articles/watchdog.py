@@ -1,38 +1,33 @@
-"""Watchdog поток: следит за РЕАЛЬНОЙ работой парсера через содержимое лога.
+"""Watchdog поток: следит за РЕАЛЬНОЙ работой парсера через heartbeat-файл.
 
 Запускается в отдельном thread (не asyncio), поэтому даже если event-loop
 повис (Playwright leak / зомби-браузер), watchdog продолжит тикать.
 
-❗ Старая версия watchdog'а проверяла mtime файла лога. Это давало
-false-positive «всё работает» в типичном hung-state, потому что APScheduler
-продолжает писать в лог «Job executed successfully» каждые 10 мин даже когда
-реальной работы не происходит. mtime обновлялся → watchdog не срабатывал.
+❗ История подхода:
+  v1 — mtime parser.log: false-positive «всё работает», APScheduler
+       продолжал писать "Job executed successfully" каждые 10 мин в hung-state.
+  v2 — grep маркеров активности в хвосте parser.log: убил false-positive,
+       но имел свои баги — окно хвоста (4MB) не всегда хватало при error-спаме,
+       а TimedRotatingFileHandler в полночь создавал свежий пустой parser.log
+       → 53 секунды спустя watchdog говорил «маркеров нет» → ложный рестарт.
+  v3 (текущий) — heartbeat sidecar файл. Парсер пишет туда epoch на каждом
+       успешном Спаршено / Автопарсинг занял / TG-articles ✓. Watchdog
+       просто читает timestamp. Никаких регулярок, ротаций, TZ-предположений.
 
-Новая логика:
-  Каждые WATCHDOG_INTERVAL_SEC сканируем последние строки лога и ищем
-  МАРКЕРЫ реальной активности:
-    • "Автопарсинг занял" — успешное завершение run_auto_parse
-    • "[TG-articles ✓]"   — успешная отправка статьи в канал
-    • "Спаршено"           — успешный парсинг одного сайта
-
-  Если ни одного маркера за WATCHDOG_STALE_SEC — это hung-state:
+  Если heartbeat старее WATCHDOG_STALE_SEC — это hung-state:
     1. Шлём в logs-чат алерт (HTTP-запрос напрямую, без asyncio)
     2. os._exit(1) → docker compose с restart: unless-stopped поднимет
-
-  Дополнительный сигнал: если в логе есть N подряд предупреждений
-  "maximum number of running instances reached" без промежуточного маркера
-  успеха — парсер точно завис.
 """
 
 import logging
 import os
-import re
 import threading
 import time
 
 import requests
 
 import config
+import heartbeat
 
 
 _logger = logging.getLogger("parser.watchdog")
@@ -48,28 +43,10 @@ _PARSER_INTERVAL_SEC = int(os.getenv("PARSER_INTERVAL_MINUTES", "60")) * 60
 _DEFAULT_STALE_SEC = max(1800, _PARSER_INTERVAL_SEC * 2)
 WATCHDOG_STALE_SEC = int(os.getenv("WATCHDOG_STALE_SEC", str(_DEFAULT_STALE_SEC)))
 
-WATCHDOG_LOG_FILE = "logs/parser.log"
-# Раньше было 200 строк / 64KB хвоста. Когда парсер залипал в Playwright и
-# логи распухали `<launching>` дампами на тысячи строк за минуты, маркеры
-# активности уползали из окна → fallback по elapsed-since-start рапортовал
-# дезинформирующий `age=78ч`. 4MB хвоста безопасно покрывает 10-12ч даже
-# тяжёлого error-спама.
-WATCHDOG_TAIL_BYTES = 4 * 1024 * 1024
-WATCHDOG_TAIL_LINES = 50_000
-
 # Время старта самого watchdog-а — используется как fallback-точка, если
-# в логе вообще ни одного маркера активности (например, все парс-сайты
-# валятся подряд → никаких "Спаршено" не появилось).
+# heartbeat-файла ещё не существует (свежий контейнер, парсер ни разу не
+# успел `touch()` или volume пустой).
 _WATCHDOG_START_TS = time.time()
-
-# Маркеры реальной активности
-_ACTIVITY_MARKERS = (
-    "Автопарсинг занял",
-    "[TG-articles ✓]",
-    "Спаршено",
-)
-# Лог-таймстамп в начале каждой строки: "YYYY-MM-DD HH:MM:SS - ..."
-_TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
 
 
 def _send_tg_alert_sync(text: str):
@@ -94,48 +71,21 @@ def _send_tg_alert_sync(text: str):
 
 
 def _last_activity_age_seconds() -> tuple[int, str] | None:
-    """Возвращает (age_seconds, source) для последнего ACTIVITY_MARKER в логе.
+    """Возвращает (age_seconds, source).
 
-    `source` — 'log' если возраст из метки в логе, 'fallback' если из времени
-    старта watchdog'а (маркеров вообще нет в хвосте). Это даёт честный сигнал
-    в алерте — мы знаем, чтó именно мерили.
+    `source` — 'heartbeat' если возраст из sidecar-файла, 'fallback' если
+    файла нет и watchdog работает уже дольше порога (на свежем контейнере
+    парсер ещё ни разу не успел touch()-нуть).
 
-    None если файл лога не найден или watchdog только что стартанул и маркеров
-    нет, но времени тоже прошло мало.
+    None если heartbeat нет и времени с старта тоже прошло мало —
+    обычное состояние первых пары минут после старта.
     """
-    if not os.path.exists(WATCHDOG_LOG_FILE):
-        return None
-    try:
-        with open(WATCHDOG_LOG_FILE, "rb") as f:
-            f.seek(0, 2)
-            size = f.tell()
-            start = max(0, size - WATCHDOG_TAIL_BYTES)
-            f.seek(start)
-            data = f.read().decode("utf-8", errors="ignore")
-        lines = data.splitlines()[-WATCHDOG_TAIL_LINES:]
-    except Exception as e:
-        _logger.warning(f"watchdog: can't read log: {e}")
-        return None
+    age = heartbeat.age_seconds()
+    if age is not None:
+        return age, "heartbeat"
 
-    # Идём с конца, ищем последнюю строку с маркером активности
-    for line in reversed(lines):
-        if any(m in line for m in _ACTIVITY_MARKERS):
-            m = _TS_RE.match(line)
-            if not m:
-                continue
-            try:
-                # Логгер пишет таймстампы в localtime контейнера. Контейнер
-                # в UTC по умолчанию; даже если TZ сдвинется, time.mktime
-                # тоже трактует struct как localtime → разница компенсируется.
-                t = time.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
-                ts = time.mktime(t)
-                return int(time.time() - ts), "log"
-            except Exception:
-                continue
-
-    # Fallback: маркеров в хвосте нет вообще. Если watchdog работает дольше
-    # порога — это либо всё рухнуло на старте, либо error-спам распух больше
-    # WATCHDOG_TAIL_BYTES. Считаем зависанием.
+    # Файла нет / битый. Если watchdog работает дольше порога — это уже
+    # подозрительно: парсер ни разу не успел отчитаться.
     elapsed = int(time.time() - _WATCHDOG_START_TS)
     if elapsed > WATCHDOG_STALE_SEC:
         return elapsed, "fallback"
@@ -150,13 +100,12 @@ def _loop():
             res = _last_activity_age_seconds()
             if res is not None and res[0] > WATCHDOG_STALE_SEC:
                 age, source = res
-                if source == "log":
+                if source == "heartbeat":
                     detail = f"Последняя успешная активность <b>{age // 60} мин назад</b>"
                 else:
                     detail = (
-                        f"В последних {WATCHDOG_TAIL_BYTES // 1024 // 1024}МБ лога "
-                        f"вообще нет маркеров успеха; watchdog работает уже "
-                        f"<b>{age // 60} мин</b> впустую"
+                        f"Heartbeat-файл отсутствует; watchdog работает уже "
+                        f"<b>{age // 60} мин</b>, парсер ни разу не отчитался"
                     )
                 msg = (
                     f"❌ <b>Парсер завис</b>\n\n"

@@ -11,6 +11,7 @@ from telegram.constants import ParseMode
 from telegram.ext import ApplicationBuilder
 
 import config
+import heartbeat
 from logging_setup import get_logger
 
 
@@ -153,6 +154,7 @@ async def send_articles(text: str, preview: bool = True):
             disable_web_page_preview=not preview,
         )
         logger.info(f"[TG-articles ✓] sent: {text[:80]}")
+        heartbeat.touch()
     except Exception as e:
         msg = f"НЕ УДАЛОСЬ отправить в канал: {e}"
         logger.error(msg)
