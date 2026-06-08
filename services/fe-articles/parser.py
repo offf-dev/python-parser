@@ -314,7 +314,6 @@ async def run_auto_parse():
             return
 
         all_new = []
-        lines = []
         errors = []
 
         # Один раз на цикл — экономим запросы к БД/файлу.
@@ -341,20 +340,10 @@ async def run_auto_parse():
                 await bot.send_log(err)
 
             if err:
-                lines.append(f"📍 {res['name']} ❌ ошибка парсинга")
                 errors.append(f"• {res['name']}: {err}")
                 continue
 
             known = global_known if config.USE_DB_FOR_ARTICLES else storage.get_known_urls(res["name"])
-            new_count = sum(1 for it in current if it["url"] not in known)
-
-            if not current:
-                lines.append(f"📍 {res['name']} (0 статей — селекторы не сработали)")
-            elif new_count == 0:
-                lines.append(f"📍 {res['name']} ({len(current)} статей, новых нет)")
-            else:
-                lines.append(f"📍 {res['name']} ({len(current)} статей, {new_count} новых)")
-
             new_items = [it for it in current if it["url"] not in known]
             if new_items:
                 storage.save_new_articles(res["name"], new_items)
@@ -368,18 +357,6 @@ async def run_auto_parse():
                         await bot.send_articles(
                             bot.format_article(it["title"], it["url"], emoji)
                         )
-
-        # Bulk-summary в articles-канал — это операционная сводка прогона
-        # парсера для аудитории канала, не ошибка. logs-чат только для алертов.
-        message = "🔥 Обновление парсинга\n\n" + "\n".join(lines) if lines else "Ничего не спарсили 😔"
-        if errors:
-            message += "\n\n⚠️ Проблемы при парсинге:\n" + "\n".join(errors)
-        if all_new:
-            if config.READONLY_DB:
-                message += f"\n\n🧪 READONLY: новых {len(all_new)} (preview уже улетел в articles)"
-            else:
-                message += f"\n\nНовых статей: {len(all_new)} (уйдут в канал по trickle-расписанию)"
-        await bot.send_summary(message)
 
         elapsed = time.perf_counter() - start
         logger.info(
