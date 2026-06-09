@@ -34,7 +34,21 @@
 <div id="parseResult"></div>
 
 {% if error %}<div class="alert alert-error">{{ error }}</div>{% endif %}
-{% if success %}<div class="alert alert-success">{{ success }}</div>{% endif %}
+{% if success %}
+    {% if parsed_articles %}
+        <div class="alert alert-success alert-with-action" id="parseSuccess">
+            <span>{{ success }}</span>
+            {% if readonly_db %}
+                <button type="button" class="btn-save-prod" disabled title="БД в READONLY — подними write-compose">Сохранить в БД (PROD)</button>
+            {% else %}
+                <button type="button" class="btn-save-prod" id="saveProdBtn">Сохранить в БД (PROD)</button>
+            {% endif %}
+        </div>
+        <script id="serverParsed" type="application/json">{{ {"resource_name": parsed_resource_name, "articles": parsed_articles, "readonly": readonly_db}|tojson }}</script>
+    {% else %}
+        <div class="alert alert-success">{{ success }}</div>
+    {% endif %}
+{% endif %}
 
 {% if table %}
 <div class="table-result">

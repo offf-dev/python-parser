@@ -313,6 +313,31 @@ td.actions {
     color: var(--on-sec-container);
     border-left-color: var(--primary);
 }
+.alert-with-action {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+}
+.alert-with-action > span { flex: 1; }
+.btn-save-prod {
+    flex: 0 0 auto;
+    padding: 8px 14px;
+    border: none;
+    border-radius: var(--radius-sm);
+    background: var(--primary, #2563eb);
+    color: #fff;
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: opacity 0.12s, background 0.12s;
+    font-family: inherit;
+}
+.btn-save-prod:hover:not(:disabled) { opacity: 0.88; }
+.btn-save-prod:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
 
 /* ====================== Tables ====================== */
 table {

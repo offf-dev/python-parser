@@ -1,4 +1,4 @@
-"""/, /parse_now — главная форма создать/редактировать ресурс + ручной парсинг."""
+"""/, /parse_now, /save_parsed — главная форма + ручной парсинг + ручная заливка в БД."""
 
 import asyncio
 
@@ -41,6 +41,8 @@ def index():
 
     resource = {}
     error = success = table = count = None
+    parsed_articles = None
+    parsed_resource_name = None
     sites_count, links_count = _counts()
 
     link_id = None
@@ -73,6 +75,8 @@ def index():
                         table = df.to_html(escape=False, index=False)
                         count = len(data)
                         success = f"Успешно спаршено {count} статей с {resource['name']}!"
+                        parsed_articles = [{"title": a["title"], "url": a["url"]} for a in data]
+                        parsed_resource_name = resource["name"]
                 except Exception as e:
                     error = f"Ошибка парсинга: {e}"
 
@@ -164,6 +168,9 @@ def index():
         resource=resource, edit_index=edit_index, link_id=link_id,
         error=error, success=success, table=table, count=count,
         sites_count=sites_count, links_count=links_count,
+        parsed_articles=parsed_articles,
+        parsed_resource_name=parsed_resource_name,
+        readonly_db=bool(config.READONLY_DB),
         current_page="main",
     )
 
@@ -207,7 +214,73 @@ async def parse_now():
             "success": True, "count": len(data),
             "table": df.to_html(escape=False, index=False),
             "resource_name": resource.get("name"),
+            "articles": [{"title": a["title"], "url": a["url"]} for a in data],
+            "readonly": bool(config.READONLY_DB),
+            "db_articles": bool(config.USE_DB_FOR_ARTICLES),
         }
     except Exception as e:
         logger.error(f"/parse_now: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@bp.route("/save_parsed", methods=["POST"])
+def save_parsed():
+    """Ручная заливка уже спаршенных статей в БД. Дедуп по links.url встроен
+    в storage.save_new_articles_db. Доступно только в local-write режиме
+    (READONLY_DB=false), иначе вернёт ошибку.
+    """
+    try:
+        payload = request.get_json(silent=True) or {}
+        resource_name = (payload.get("resource_name") or "").strip()
+        articles = payload.get("articles") or []
+
+        if not resource_name:
+            return {"success": False, "error": "Не указан resource_name"}
+        if not isinstance(articles, list) or not articles:
+            return {"success": False, "error": "Пустой список статей"}
+
+        if config.READONLY_DB:
+            return {"success": False, "error": "БД в READONLY-режиме — запусти write-compose"}
+        if not config.USE_DB_FOR_ARTICLES or not storage.SessionLocal:
+            return {"success": False, "error": "БД для статей не подключена"}
+
+        clean = []
+        for a in articles:
+            url = (a.get("url") or "").strip()
+            title = (a.get("title") or "").strip()
+            if url and title:
+                clean.append({"url": url, "title": title})
+        if not clean:
+            return {"success": False, "error": "Нет валидных {title,url} в payload"}
+
+        known = storage.get_known_urls()
+        new_items = [a for a in clean if a["url"] not in known]
+        skipped_dup = len(clean) - len(new_items)
+
+        if not new_items:
+            return {"success": True, "saved": 0, "skipped_dup": skipped_dup,
+                    "message": f"Все {skipped_dup} статей уже в БД"}
+
+        links_before = 0
+        links_after = 0
+        with storage.SessionLocal() as s:
+            links_before = s.execute(text("SELECT COUNT(*) FROM links")).scalar() or 0
+
+        storage.save_new_articles(resource_name, new_items)
+
+        with storage.SessionLocal() as s:
+            links_after = s.execute(text("SELECT COUNT(*) FROM links")).scalar() or 0
+
+        saved = max(0, links_after - links_before)
+        logger.info(
+            f"/save_parsed: {resource_name} → submitted={len(clean)} "
+            f"skipped_dup={skipped_dup} saved={saved}"
+        )
+        return {
+            "success": True, "saved": saved,
+            "skipped_dup": skipped_dup, "submitted": len(clean),
+            "resource_name": resource_name,
+        }
+    except Exception as e:
+        logger.error(f"/save_parsed: {e}")
         return {"success": False, "error": str(e)}
