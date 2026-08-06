@@ -74,6 +74,53 @@ _STEALTH_INIT = [
 ]
 
 
+class BlockedByAntibot(Exception):
+    """Антибот-защита (Cloudflare и т.п.) не пустила нас на страницу.
+
+    Принципиально отличается от «селекторы не найдены»: чинится не правкой
+    CSS-селекторов, а сменой IP / темпа запросов. Раньше оба случая
+    сваливались в один алерт, и ежечасные ложные «❌ селекторы не найдены»
+    от заблокированных ресурсов топили настоящие поломки вёрстки.
+    """
+
+    def __init__(self, reason: str, status: int = None):
+        super().__init__(reason)
+        self.reason = reason
+        self.status = status
+
+
+# Префикс error-строки, по которому run_auto_parse отличает блокировку от
+# прочих ошибок в сводке цикла.
+BLOCKED_PREFIX = "заблокирован антиботом"
+
+# Статусы, на которых Cloudflare отдаёт challenge/deny вместо контента.
+_BLOCK_STATUSES = {403, 429, 503}
+
+_BLOCK_MARKERS = (
+    "just a moment",                          # CF managed challenge
+    "errorcode: 1015",                        # CF rate limiting
+    "used cloudflare to restrict access",     # заглушка 1015/1020
+    "attention required",                     # CF firewall rule (1020)
+    "checking your browser before accessing",  # старый CF JS-челлендж
+    "cf-browser-verification",
+    "__cf_chl",                               # артефакт скрипта челленджа
+)
+
+# Потолок размера, ниже которого тело с маркером считаем заглушкой даже при
+# HTTP 200. Реальные листинги в проде — от 31 КБ; заглушки CF — 6-9 КБ.
+# Порог посередине, с запасом в обе стороны.
+_STUB_MAX_BYTES = 20_000
+
+
+def _block_marker(html_text: str) -> str:
+    """Возвращает найденный маркер антибот-заглушки или None."""
+    low = html_text.lower()
+    for m in _BLOCK_MARKERS:
+        if m in low:
+            return m
+    return None
+
+
 async def fetch_html(url: str, *, headers=None, retries=None, timeout_ms=None,
                      wait_for_selector: str = None) -> str:
     """Headless Playwright Chromium с антидетект-настройками.
@@ -111,10 +158,29 @@ async def fetch_html(url: str, *, headers=None, retries=None, timeout_ms=None,
                 await page.add_init_script(script)
 
             last_err = None
+            status = None
             for attempt in range(retries):
                 try:
                     await asyncio.sleep(random.uniform(1, 3))
-                    await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                    resp = await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+
+                    # Ранняя проверка на антибот-заглушку. Делать её надо ДО
+                    # wait_for_selector: на странице челленджа селектора нет и
+                    # не будет, а ожидание стоит 25с + 15с networkidle + 3с —
+                    # 43 секунды впустую на каждый заблокированный ресурс.
+                    if resp is not None:
+                        status = resp.status
+                        mitigated = resp.headers.get("cf-mitigated")
+                        if mitigated:
+                            raise BlockedByAntibot(
+                                f"Cloudflare challenge (cf-mitigated: {mitigated}, HTTP {status})",
+                                status,
+                            )
+                        if status in _BLOCK_STATUSES:
+                            marker = _block_marker(await page.content())
+                            detail = f", маркер: {marker!r}" if marker else ""
+                            raise BlockedByAntibot(f"HTTP {status} от антибота{detail}", status)
+
                     if wait_for_selector:
                         # Ждём конкретный селектор. Если не появится за 25с — попробуем
                         # networkidle и фиксированный wait как fallback.
@@ -136,13 +202,30 @@ async def fetch_html(url: str, *, headers=None, retries=None, timeout_ms=None,
                         except Exception:
                             await page.wait_for_timeout(5000)
                     break
+                except BlockedByAntibot:
+                    # Ретраить бессмысленно и вредно: повторный стук в том же
+                    # окне mitigation-таймаута только продлевает блокировку
+                    # (проверено — 3 попытки с интервалом 20с не пробились,
+                    # а 200с тишины дали HTTP 200 с первого раза).
+                    raise
                 except Exception as e:
                     last_err = e
                     logger.warning(f"goto fail attempt {attempt + 1}/{retries} for {url}: {e}")
             else:
                 raise last_err
 
-            return await page.content()
+            content = await page.content()
+            # Вторая линия: CF иногда отдаёт заглушку с HTTP 200, а бывает что
+            # скрипт челленджа к этому моменту уже вычистил DOM (в проде это
+            # выглядело как «HTML длина: 39» — пустой <html><body></body></html>).
+            if len(content) < _STUB_MAX_BYTES:
+                marker = _block_marker(content)
+                if marker:
+                    raise BlockedByAntibot(
+                        f"антибот-заглушка в теле ответа (HTTP {status}, маркер: {marker!r})",
+                        status,
+                    )
+            return content
         finally:
             try:
                 await browser.close()
@@ -263,6 +346,72 @@ def _admin_msg(resource: dict, problem: str) -> str:
     )
 
 
+def _blocked_msg(resource: dict, reason: str) -> str:
+    """Алерт про антибот-блокировку — без слова «селекторы».
+
+    Главное отличие от _admin_msg: явно сказано, что править селекторы не надо,
+    иначе на этот алерт реагируют не тем действием.
+    """
+    esc = _html.escape
+    return (
+        f"🛡 <b>{esc(resource.get('name', 'unknown'))}</b> — блокировка антиботом\n"
+        f"{esc(reason)}\n\n"
+        f"URL: {esc(resource.get('url', '?'))}\n\n"
+        f"Это <b>не</b> поломка вёрстки — селекторы править не нужно. "
+        f"Лечится сменой IP (резидентный прокси) или снижением частоты запросов.\n"
+        f"Повторные сообщения по этому ресурсу подавлены до смены состояния."
+    )
+
+
+# name → (состояние, monotonic-время последнего алерта).
+# Состояния: "ok" | "blocked" | "selectors" | "error".
+# Сбрасывается при рестарте контейнера — как и _ALERTED_DOMAIN_IDS выше.
+_RESOURCE_STATE: dict[str, tuple[str, float]] = {}
+
+_STATE_LABEL = {
+    "blocked": "блокировка антиботом",
+    "selectors": "селекторы не найдены",
+    "error": "сайт недоступен",
+}
+
+# Даже при неизменном состоянии раз в N часов напоминаем — чтобы «тихо сломано»
+# не превратилось в «тихо забыто». 0 = не напоминать вообще.
+_ALERT_REPEAT_SEC = int(os.getenv("ALERT_REPEAT_HOURS", "12")) * 3600
+
+
+async def _notify_state(resource: dict, state: str, msg: str = None):
+    """Шлёт алерт только при смене состояния ресурса (или раз в ALERT_REPEAT_HOURS).
+
+    До этого каждый цикл слал по алерту на каждый упавший ресурс: два вечно
+    заблокированных сайта давали ~48 сообщений в сутки, и настоящая поломка
+    вёрстки в этом потоке была неотличима от фона.
+    """
+    name = resource.get("name", "unknown")
+    prev = _RESOURCE_STATE.get(name)
+    now = time.monotonic()
+
+    if state == "ok":
+        if prev and prev[0] != "ok":
+            await bot.send_notice(
+                f"✅ <b>{_html.escape(name)}</b> снова парсится "
+                f"(было: {_STATE_LABEL.get(prev[0], prev[0])})"
+            )
+        _RESOURCE_STATE[name] = ("ok", now)
+        return
+
+    if prev and prev[0] == state:
+        stale = _ALERT_REPEAT_SEC and (now - prev[1]) >= _ALERT_REPEAT_SEC
+        if not stale:
+            logger.info(f"{name}: состояние '{state}' не изменилось — алерт подавлен")
+            return
+
+    if state == "blocked":
+        await bot.send_notice(msg)
+    else:
+        await bot.send_log(msg)
+    _RESOURCE_STATE[name] = (state, now)
+
+
 async def parse_resource(resource: dict, limit: int = None, blocked_keywords: list = None):
     """Полный цикл парсинга одного ресурса. Возвращает (data, error_msg)."""
     limit = limit or config.PARSE_LIMIT
@@ -291,15 +440,21 @@ async def parse_resource(resource: dict, limit: int = None, blocked_keywords: li
         )
         if not data:
             problem = "селекторы не найдены или все статьи отфильтрованы"
-            await bot.send_log(_admin_msg(resource, problem))
+            await _notify_state(resource, "selectors", _admin_msg(resource, problem))
             return [], problem
         logger.info(f"Спаршено {len(data)} статей с {resource['name']}")
         heartbeat.touch()
+        await _notify_state(resource, "ok")
         return data, None
+    except BlockedByAntibot as e:
+        problem = f"{BLOCKED_PREFIX}: {e.reason}"
+        logger.warning(f"БЛОКИРОВКА {resource.get('name', 'unknown')}: {e.reason}")
+        await _notify_state(resource, "blocked", _blocked_msg(resource, e.reason))
+        return [], problem
     except Exception as e:
         problem = f"сайт недоступен: {e}"
         logger.error(f"ОШИБКА парсинга {resource.get('name', 'unknown')}: {problem}")
-        await bot.send_log(_admin_msg(resource, problem))
+        await _notify_state(resource, "error", _admin_msg(resource, problem))
         return [], problem
 
 
@@ -359,9 +514,11 @@ async def run_auto_parse():
                         )
 
         elapsed = time.perf_counter() - start
+        blocked_n = sum(1 for e in errors if BLOCKED_PREFIX in e)
         logger.info(
             f"Автопарсинг занял {elapsed:.2f}с | "
             f"всего новых: {len(all_new)} | ошибок: {len(errors)}"
+            f" (из них блокировок: {blocked_n})"
         )
         heartbeat.touch()
 

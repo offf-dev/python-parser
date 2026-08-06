@@ -183,6 +183,26 @@ async def send_summary(text: str):
         logger.error(f"НЕ УДАЛОСЬ отправить summary: {e}")
 
 
+async def send_notice(text: str):
+    """Операционное уведомление в logs-чат — без обёртки «🚨 Ошибка в парсере».
+
+    Для сообщений вида «ресурс заблокирован антиботом» / «снова парсится»:
+    это состояние внешнего мира, а не сбой нашего кода, и выглядеть как
+    авария оно не должно — иначе настоящие ошибки теряются в потоке.
+    """
+    if not _logs_bot:
+        logger.info(f"[TG-logs OFF] would notice: {text[:200]}")
+        return
+    try:
+        await _send_with_html_fallback(
+            _logs_bot, config.TELEGRAM_CHANNEL_ID_LOGS, text,
+            disable_web_page_preview=True,
+        )
+        logger.info(f"[TG-logs ✓] notice: {text[:80]}")
+    except Exception as e:
+        logger.error(f"НЕ УДАЛОСЬ отправить notice в logs-чат: {e}")
+
+
 async def send_log(error_msg: str):
     """Шлёт в админ-чат. No-op если бот выключен."""
     if not _logs_bot:
