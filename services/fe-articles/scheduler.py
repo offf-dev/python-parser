@@ -133,5 +133,7 @@ async def send_startup_message():
     )
     # В summary-канал — операционный апдейт
     await bot.send_summary(msg)
-    # В logs-чат — на случай если контейнер ожил после watchdog-кика, чтобы было видно
-    await bot.send_log("✅ " + msg)
+    # В logs-чат — на случай если контейнер ожил после watchdog-кика, чтобы было видно.
+    # Именно notice, а не send_log: send_log вешает шапку «🚨 Ошибка в парсере!», и
+    # штатный старт выглядел в чате как авария.
+    await bot.send_notice("⚠️ " + msg)

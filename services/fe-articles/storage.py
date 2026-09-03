@@ -8,7 +8,7 @@ import traceback
 from datetime import datetime
 
 from sqlalchemy import create_engine, text
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import sessionmaker
 
 import config
@@ -144,12 +144,25 @@ def find_or_create_domain(name: str):
                     logger.info(f"[READONLY] would CREATE domain: {name}")
                     return None
                 logger.info(f"Создание нового домена: {name}")
-                session.execute(text(
-                    "INSERT INTO domains (name, emoji, created_at, updated_at) "
-                    "VALUES (:name, :e, NOW(), NOW())"
-                ), {"name": name, "e": DEFAULT_DOMAIN_EMOJI})
-                session.commit()
-                domain_id = session.execute(text("SELECT LAST_INSERT_ID()")).scalar()
+                try:
+                    res = session.execute(text(
+                        "INSERT INTO domains (name, emoji, created_at, updated_at) "
+                        "VALUES (:name, :e, NOW(), NOW())"
+                    ), {"name": name, "e": DEFAULT_DOMAIN_EMOJI})
+                    # id берём из курсора этого же INSERT'а, а НЕ через
+                    # SELECT LAST_INSERT_ID() после commit(): commit отдаёт соединение
+                    # обратно в пул, следующий execute берёт из пула любое другое, и
+                    # LAST_INSERT_ID() там возвращает чужой id — обычно из links.
+                    # Такой id уезжал в links.domain_id и ронял весь батч по FK
+                    # (1452 fk_links_domain).
+                    domain_id = res.lastrowid
+                    session.commit()
+                except IntegrityError:
+                    # Гонка: домен успели создать параллельно (name UNIQUE) — берём его id.
+                    session.rollback()
+                    domain_id = session.execute(
+                        text("SELECT id FROM domains WHERE name = :name"), {"name": name}
+                    ).scalar()
             return domain_id
     except Exception as e:
         logger.error(f"Ошибка find_or_create_domain для {name}: {e}\n{traceback.format_exc()}")
