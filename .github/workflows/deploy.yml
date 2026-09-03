@@ -9,6 +9,9 @@ concurrency:
   group: deploy-stage
   cancel-in-progress: false
 
+permissions:
+  contents: read
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
@@ -39,20 +42,42 @@ jobs:
         env:
           FE: ${{ steps.changed.outputs.fe }}
           NC: ${{ steps.changed.outputs.nc }}
+          GH_TOKEN: ${{ github.token }}
         with:
           host: ${{ secrets.SERVER_IP_STAGE }}
           username: ${{ secrets.SERVER_USERNAME }}
           key: ${{ secrets.SERVER_SSH_KEY }}
-          envs: FE,NC
+          envs: FE,NC,GH_TOKEN
           script_stop: true
           script: |
             set -euo pipefail
 
             cd /var/www/python-parser
 
-            echo "==> git pull origin main"
-            git fetch --quiet origin main
-            git reset --hard origin/main
+            echo "==> git fetch origin main"
+            # Анонимный HTTPS-фетч GitHub периодически отвечает 401 (рейт-лимит на IP
+            # дата-центра), git идёт спрашивать логин и падает с «could not read
+            # Username» — именно так деплой da272e7 и умер. Поэтому ходим с ephemeral
+            # GITHUB_TOKEN (через заголовок, чтобы он не осел в .git/config и в логах)
+            # и даём пару ретраев на сетевые всплески.
+            export GIT_TERMINAL_PROMPT=0
+            AUTH="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+            ok=false
+            for i in 1 2 3; do
+              # сначала с токеном, если он почему-то не сработал — анонимно
+              if git -c http.extraheader="$AUTH" fetch --quiet origin main \
+                 || git fetch --quiet origin main; then
+                ok=true
+                break
+              fi
+              echo "git fetch: попытка $i не удалась, повтор через $((i * 5))с"
+              sleep $((i * 5))
+            done
+            if [ "$ok" != "true" ]; then
+              echo "git fetch не удался после 3 попыток"
+              exit 1
+            fi
+            git reset --hard FETCH_HEAD
             git clean -fd  # убираем untracked — на dev-сервере это сейф, /var/www/python-parser именно для прод-копии
 
             if [ "${FE:-false}" = "true" ]; then
