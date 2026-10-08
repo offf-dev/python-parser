@@ -1,0 +1,9 @@
+# Еженедельная чистка docker build cache: удаляет слои, к которым не обращались
+# 7 дней. Образы, контейнеры, тома и /var/www не трогает, контейнеры не
+# перезапускает — соседям (busygym, ukrsibbank, fruntend) грозит только более
+# долгая пересборка, если их не собирали больше недели.
+# Поставлено 2026-09-03: кэш дорос до 14 ГБ и забил / до 85%.
+SHELL=/bin/sh
+PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+
+0 4 * * 0 root sh -c 'date -Is; docker builder prune -f --filter until=168h' >> /var/log/docker-builder-prune.log 2>&1

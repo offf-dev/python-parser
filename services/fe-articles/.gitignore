@@ -1,2 +1,3 @@
 static/icons/
 _*.py
+.env.bak*

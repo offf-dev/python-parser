@@ -1,0 +1,10 @@
+# Ежечасная проверка диска/памяти/swap. При выходе за пороги шлёт алерт в
+# админ-чат парсера ботом @fruntend_errors_bot (токен читается из .env парсера,
+# в скрипте не хранится). Повторный алерт — не чаще раза в сутки, возврат в
+# норму сообщается отдельно.
+# Пороги: диск >=80%, доступной памяти <300 МБ, swap >=75%.
+# Поставлено 2026-10-08.
+SHELL=/bin/sh
+PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+
+17 * * * * root /usr/local/bin/server-health-alert.sh >> /var/log/server-health-alert.log 2>&1
