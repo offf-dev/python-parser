@@ -722,3 +722,102 @@ label.inline {
     border: 2px solid var(--surface-low);
 }
 ::-webkit-scrollbar-thumb:hover { background: var(--outline); }
+
+/* =====================================================================
+   /debug — пошаговый подбор селекторов
+   ===================================================================== */
+.dbg-wizard {
+    margin-top: 24px;
+}
+
+.dbg-step {
+    background: var(--surface-low);
+    border: 1px solid var(--outline-variant);
+    border-radius: var(--radius-sm);
+    padding: 16px 18px;
+    margin-bottom: 16px;
+}
+
+.dbg-label {
+    display: block;
+    font-weight: 600;
+    font-size: 15px;
+    color: var(--on-surface);
+    margin-bottom: 4px;
+}
+
+.dbg-hint {
+    font-size: 13px;
+    color: var(--on-surface-variant);
+    margin-bottom: 10px;
+    line-height: 1.45;
+}
+
+.dbg-input {
+    width: 100%;
+    padding: 10px 12px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 14px;
+    border: 1px solid var(--outline);
+    border-radius: var(--radius-sm);
+    background: var(--surface);
+    color: var(--on-surface);
+}
+
+.dbg-input:focus {
+    outline: 2px solid var(--primary);
+    outline-offset: -1px;
+}
+
+.dbg-out:empty {
+    display: none;
+}
+
+.dbg-notes {
+    margin: 8px 0 0 18px;
+    padding: 0;
+    font-size: 13px;
+    color: var(--on-surface-variant);
+    line-height: 1.5;
+}
+
+.dbg-samples {
+    margin-top: 10px;
+    font-size: 13px;
+    color: var(--on-surface-variant);
+}
+
+.dbg-samples ol,
+.dbg-samples ul {
+    margin: 6px 0 0 20px;
+    padding: 0;
+    line-height: 1.5;
+}
+
+.dbg-samples pre {
+    background: var(--surface-high);
+    padding: 10px 12px;
+    border-radius: var(--radius-sm);
+    overflow-x: auto;
+    font-size: 12.5px;
+    margin: 6px 0 8px;
+}
+
+.dbg-details {
+    margin-top: 10px;
+    font-size: 13px;
+}
+
+.dbg-details summary {
+    cursor: pointer;
+    color: var(--primary);
+}
+
+.dbg-details pre {
+    background: var(--surface-high);
+    padding: 10px 12px;
+    border-radius: var(--radius-sm);
+    overflow-x: auto;
+    font-size: 12.5px;
+    max-height: 320px;
+}

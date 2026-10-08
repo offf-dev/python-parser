@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block title %}Debug HTML — Парсер{% endblock %}
 {% block content %}
-<h1>Debug: получить HTML страницы</h1>
+<h1>Debug: HTML и селекторы</h1>
 
 <form id="debugForm" method="post" class="form">
     <input type="text" name="url" placeholder="URL страницы" value="{{ url if url else '' }}" required>
@@ -15,9 +15,47 @@
 <div id="loading" class="loading" style="display:none;">⏳ Загрузка HTML... Пожалуйста, подождите</div>
 <div id="debugResult"></div>
 
+{# Подбор селекторов. Показывается только после того, как HTML получен:
+   проверять селекторы, не имея страницы, нечего. #}
+<div id="selectorWizard" class="dbg-wizard" style="display:none;">
+
+    <div class="dbg-step" id="step-item">
+        <label class="dbg-label" for="sel-item">1. Селектор блока статьи</label>
+        <div class="dbg-hint">Повторяющаяся карточка в списке — то, что потом перебирает парсер.
+            Например <code>article</code> или <code>.post-list .post</code>.</div>
+        <input type="text" id="sel-item" class="dbg-input" placeholder="article" autocomplete="off">
+        <div class="dbg-out" id="out-item"></div>
+    </div>
+
+    <div class="dbg-step" id="step-title" style="display:none;">
+        <label class="dbg-label" for="sel-title">2. Селектор заголовка — внутри блока</label>
+        <div class="dbg-hint">Ищется внутри каждой карточки, путь от корня страницы писать не нужно.
+            Берётся текст всего элемента со вложенными, поэтому элемент должен содержать только название.</div>
+        <input type="text" id="sel-title" class="dbg-input" placeholder="h2 a" autocomplete="off">
+        <div class="dbg-out" id="out-title"></div>
+    </div>
+
+    <div class="dbg-step" id="step-link" style="display:none;">
+        <label class="dbg-label" for="sel-link">3. Селектор ссылки — внутри блока</label>
+        <div class="dbg-hint">Берётся <code>href</code> (или <code>data-href</code>).
+            Если сама карточка — это <code>&lt;a&gt;</code>, впиши <code>{{ this_article }}</code>.</div>
+        <input type="text" id="sel-link" class="dbg-input" placeholder="h2 a" autocomplete="off">
+        <div class="dbg-out" id="out-link"></div>
+    </div>
+
+    <div class="dbg-step" id="step-final" style="display:none;">
+        <div class="dbg-label">Итог: что вернёт парсер</div>
+        <div class="dbg-hint">Уже с фильтрами, нормализацией ссылок и лимитом — то же самое,
+            что уедет в канал.</div>
+        <div class="dbg-out" id="out-final"></div>
+    </div>
+
+</div>
+
 {% if error %}<div class="alert alert-error">{{ error }}</div>{% endif %}
 {% endblock %}
 
 {% block scripts %}
+<script>window.THIS_ARTICLE = {{ this_article | tojson }};</script>
 <script src="{{ url_for('static', filename='js/debug.js') }}"></script>
 {% endblock %}
