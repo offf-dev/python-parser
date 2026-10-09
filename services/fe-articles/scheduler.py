@@ -52,7 +52,15 @@ async def send_oldest_unsent_article():
                     if not article:
                         return
                     msg = bot.format_article(article["title"], article["url"], article.get("emoji"))
-                    await bot.send_articles(msg)
+                    # is_send ставим ТОЛЬКО если сообщение реально ушло.
+                    # Иначе статья исчезала: отправка падала по таймауту, а
+                    # флаг всё равно выставлялся, и trickle её не повторял.
+                    if not await bot.send_articles(msg):
+                        logger.warning(
+                            f"Статья id={article['id']} не отправлена, "
+                            f"is_send не меняем — повторим на следующем тике"
+                        )
+                        return
                     if config.READONLY_DB:
                         logger.info(f"[READONLY] would mark is_send=1 для id={article['id']}")
                     else:
@@ -82,7 +90,11 @@ async def send_oldest_unsent_article():
                 if r.get("name") == target_site:
                     emoji = r.get("emoji")
                     break
-            await bot.send_articles(bot.format_article(target_art["title"], target_art["url"], emoji))
+            if not await bot.send_articles(
+                bot.format_article(target_art["title"], target_art["url"], emoji)
+            ):
+                logger.warning(f"[JSON] не отправлена: {target_art['title'][:80]} — повторим")
+                return
             last[target_site][target_idx]["is_send"] = True
             storage.save_last_results(last)
             logger.info(f"[JSON] Отправлена: {target_art['title'][:80]}")

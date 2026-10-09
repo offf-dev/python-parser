@@ -141,13 +141,18 @@ async def _send_with_html_fallback(bot_obj, chat_id, text: str, **kwargs):
             return True
 
 
-async def send_articles(text: str, preview: bool = True):
+async def send_articles(text: str, preview: bool = True) -> bool:
     """Шлёт в публичный канал. No-op если бот выключен.
     По умолчанию preview включён — статьи рендерятся как карточки с фавиконом.
+
+    Возвращает True только если сообщение реально ушло. Вызывающий код по
+    этому флагу решает, помечать ли статью отправленной: раньше функция
+    глотала сетевую ошибку и молча возвращалась, статья получала is_send=1 и
+    терялась навсегда (trickle её больше не подбирал).
     """
     if not _articles_bot:
         logger.info(f"[TG-articles OFF] would send: {text[:120]}...")
-        return
+        return False
     try:
         await _send_with_html_fallback(
             _articles_bot, config.TELEGRAM_CHANNEL_ID_ARTICLES, text,
@@ -155,10 +160,12 @@ async def send_articles(text: str, preview: bool = True):
         )
         logger.info(f"[TG-articles ✓] sent: {text[:80]}")
         heartbeat.touch()
+        return True
     except Exception as e:
         msg = f"НЕ УДАЛОСЬ отправить в канал: {e}"
         logger.error(msg)
         await send_log(msg)
+        return False
 
 
 async def send_summary(text: str):
