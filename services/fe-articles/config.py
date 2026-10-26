@@ -38,6 +38,21 @@ PARSER_INTERVAL_MINUTES = int(os.getenv("PARSER_INTERVAL_MINUTES", 10))
 SENDER_INTERVAL_MINUTES = int(os.getenv("SENDER_INTERVAL_MINUTES", 10))
 ENABLE_SCHEDULER = os.getenv("ENABLE_SCHEDULER", "true").lower() not in ("false", "0", "no")
 
+# Пауза с джиттером между сайтами внутри одного цикла. 0 = без пауз.
+# Нужна, чтобы цикл не выглядел как «ровно один запрос в 5 секунд по кругу»:
+# при 24 ресурсах добавляет к циклу ~2-6 минут, что при часовом интервале
+# ничего не стоит. Если PARSER_INTERVAL_MINUTES маленький — уменьшить.
+PARSE_DELAY_MIN_SEC = float(os.getenv("PARSE_DELAY_MIN_SEC", 5))
+PARSE_DELAY_MAX_SEC = float(os.getenv("PARSE_DELAY_MAX_SEC", 15))
+
+# Случайный сдвиг старта цикла парсинга, ±секунды. Без него парсинг уходил
+# ровно в :15 каждый час — идеально предсказуемо для любого антибота.
+# По умолчанию — шестая часть интервала, но не больше 10 минут: при коротком
+# PARSER_INTERVAL_MINUTES фиксированные 600с съедали бы весь интервал.
+PARSER_JITTER_SEC = int(os.getenv(
+    "PARSER_JITTER_SEC", min(600, PARSER_INTERVAL_MINUTES * 60 // 6)
+))
+
 # Авто-удаление старых отправленных ссылок из links. 0 = не удалять.
 # Удаляются только записи с is_send=1 (неотправленные не трогаем — это очередь).
 LINKS_RETENTION_DAYS = int(os.getenv("LINKS_RETENTION_DAYS", 90))

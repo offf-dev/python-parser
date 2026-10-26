@@ -119,6 +119,7 @@ def configure_jobs():
     scheduler.add_job(
         parser.run_auto_parse, trigger="interval",
         minutes=config.PARSER_INTERVAL_MINUTES,
+        jitter=config.PARSER_JITTER_SEC or None,
         next_run_time=datetime.now() + timedelta(seconds=30),
         id="auto_parse_job", max_instances=1, coalesce=True,
     )

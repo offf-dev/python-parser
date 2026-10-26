@@ -23,6 +23,7 @@ from bs4 import BeautifulSoup
 from flask import Blueprint, jsonify, render_template, request
 
 import config
+import normalize
 import parser
 import storage
 from logging_setup import get_logger
@@ -240,7 +241,9 @@ def debug():
     is_ajax = request.form.get("ajax") == "true"
 
     if request.method == "POST":
-        url = request.form["url"].strip()
+        # Голый хост без схемы Playwright не глотает — дописываем https://,
+        # иначе форма отвечает маловразумительным "Cannot navigate to invalid URL".
+        url = normalize.ensure_scheme(request.form["url"])
         clean_assets = "clean_assets" in request.form
         token = None
         try:

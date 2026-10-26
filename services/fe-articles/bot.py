@@ -4,10 +4,13 @@
 поднять парсер локально без токенов.
 """
 
+import asyncio
 import html as _html
+import random
 import re
 
 from telegram.constants import ParseMode
+from telegram.error import NetworkError, TimedOut
 from telegram.ext import ApplicationBuilder
 
 import config
@@ -141,6 +144,26 @@ async def _send_with_html_fallback(bot_obj, chat_id, text: str, **kwargs):
             return True
 
 
+# Ретрай отправки внутри тика. Без него единичный сетевой сбой стоил статье
+# +10 минут: флаг is_send не выставлялся (и это правильно), но trickle-job
+# подбирал её только на следующем тике.
+_SEND_ATTEMPTS = 3
+_SEND_RETRY_BASE_SEC = 3
+
+
+def _is_safe_to_retry(exc: Exception) -> bool:
+    """Повторяем только то, что заведомо НЕ дошло до Telegram.
+
+    ConnectError и прочие NetworkError — соединение не установилось, дубля не
+    будет. TimedOut — ответ не получен, но сообщение могло уйти: повтор здесь
+    дал бы две одинаковые статьи в канале. Такое отдаём следующему тику,
+    где между попытками хотя бы 10 минут.
+    """
+    if isinstance(exc, TimedOut):
+        return False
+    return isinstance(exc, NetworkError)
+
+
 async def send_articles(text: str, preview: bool = True) -> bool:
     """Шлёт в публичный канал. No-op если бот выключен.
     По умолчанию preview включён — статьи рендерятся как карточки с фавиконом.
@@ -153,19 +176,32 @@ async def send_articles(text: str, preview: bool = True) -> bool:
     if not _articles_bot:
         logger.info(f"[TG-articles OFF] would send: {text[:120]}...")
         return False
-    try:
-        await _send_with_html_fallback(
-            _articles_bot, config.TELEGRAM_CHANNEL_ID_ARTICLES, text,
-            disable_web_page_preview=not preview,
-        )
-        logger.info(f"[TG-articles ✓] sent: {text[:80]}")
-        heartbeat.touch()
-        return True
-    except Exception as e:
-        msg = f"НЕ УДАЛОСЬ отправить в канал: {e}"
-        logger.error(msg)
-        await send_log(msg)
-        return False
+
+    last_err = None
+    for attempt in range(1, _SEND_ATTEMPTS + 1):
+        try:
+            await _send_with_html_fallback(
+                _articles_bot, config.TELEGRAM_CHANNEL_ID_ARTICLES, text,
+                disable_web_page_preview=not preview,
+            )
+            logger.info(f"[TG-articles ✓] sent: {text[:80]}")
+            heartbeat.touch()
+            return True
+        except Exception as e:
+            last_err = e
+            if attempt >= _SEND_ATTEMPTS or not _is_safe_to_retry(e):
+                break
+            delay = _SEND_RETRY_BASE_SEC * (2 ** (attempt - 1)) + random.uniform(0, 1)
+            logger.warning(
+                f"TG send attempt {attempt}/{_SEND_ATTEMPTS} failed ({e}); "
+                f"retry через {delay:.1f}с"
+            )
+            await asyncio.sleep(delay)
+
+    msg = f"НЕ УДАЛОСЬ отправить в канал: {last_err}"
+    logger.error(msg)
+    await send_log(msg)
+    return False
 
 
 async def send_summary(text: str):

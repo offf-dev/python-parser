@@ -20,3 +20,20 @@ def normalize_url(url: str, base_url: str = None) -> str:
     parts = urlparse(url)
     path = _MULTI_SLASH.sub("/", parts.path) if parts.path else parts.path
     return urlunparse(parts._replace(path=path))
+
+
+_HAS_SCHEME = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://")
+
+
+def ensure_scheme(url: str, default: str = "https") -> str:
+    """Дописывает схему, если её нет: `example.com/x` → `https://example.com/x`.
+
+    Playwright на голом хосте падает не «сайт недоступен», а
+    `Protocol error (Page.navigate): Cannot navigate to invalid URL` — и в
+    логе это выглядит как поломка парсера, хотя человек просто не набрал
+    `https://` в форме.
+    """
+    url = (url or "").strip()
+    if not url or _HAS_SCHEME.match(url):
+        return url
+    return f"{default}://{url.lstrip('/')}"

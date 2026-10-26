@@ -346,7 +346,7 @@ def _admin_msg(resource: dict, problem: str) -> str:
     )
 
 
-def _blocked_msg(resource: dict, reason: str) -> str:
+def _blocked_msg(resource: dict, reason: str, pause_hours: float = None) -> str:
     """Алерт про антибот-блокировку — без слова «селекторы».
 
     Главное отличие от _admin_msg: явно сказано, что править селекторы не надо,
@@ -360,6 +360,7 @@ def _blocked_msg(resource: dict, reason: str) -> str:
         f"Это <b>не</b> поломка вёрстки — селекторы править не нужно. "
         f"Лечится сменой IP (резидентный прокси) или снижением частоты запросов.\n"
         f"Повторные сообщения по этому ресурсу подавлены до смены состояния."
+        + (f"\nСледующая попытка — через {pause_hours} ч." if pause_hours else "")
     )
 
 
@@ -367,6 +368,44 @@ def _blocked_msg(resource: dict, reason: str) -> str:
 # Состояния: "ok" | "blocked" | "selectors" | "error".
 # Сбрасывается при рестарте контейнера — как и _ALERTED_DOMAIN_IDS выше.
 _RESOURCE_STATE: dict[str, tuple[str, float]] = {}
+
+# name → monotonic-время, когда ресурс вошёл в текущее нештатное состояние.
+# Нужно отдельным словарём, чтобы не ломать распаковку prev[0]/prev[1] выше.
+_STATE_SINCE: dict[str, float] = {}
+
+# ====================== Backoff по заблокированным ресурсам ======================
+# name → (monotonic-время, до которого ресурс пропускаем; номер страйка).
+#
+# Без этого заблокированный ресурс долбился каждый цикл: webdesignernews.com
+# отдавал 429 с 23.10 по 26.10 — 72 захода подряд, ноль успехов, каждый с
+# полноценным запуском Chromium. Это и трата ресурсов, и то, что держит бан
+# свежим: антибот видит ровно тот же паттерн, из-за которого забанил.
+_BLOCK_COOLDOWN: dict[str, tuple[float, int]] = {}
+
+# Растущая пауза: 1ч → 2 → 4 → 12, дальше потолок. Сбрасывается первым успехом.
+_BLOCK_BACKOFF_HOURS = (1, 2, 4, 12)
+
+
+def _block_cooldown_left(name: str) -> float:
+    """Сколько секунд ещё пропускать ресурс. 0 — можно парсить."""
+    entry = _BLOCK_COOLDOWN.get(name)
+    if not entry:
+        return 0.0
+    return max(0.0, entry[0] - time.monotonic())
+
+
+def _block_cooldown_bump(name: str) -> float:
+    """Ресурс снова заблокирован — продлеваем паузу. Возвращает её длину в часах."""
+    _, strikes = _BLOCK_COOLDOWN.get(name, (0.0, 0))
+    idx = min(strikes, len(_BLOCK_BACKOFF_HOURS) - 1)
+    hours = _BLOCK_BACKOFF_HOURS[idx]
+    _BLOCK_COOLDOWN[name] = (time.monotonic() + hours * 3600, strikes + 1)
+    return hours
+
+
+def _block_cooldown_clear(name: str):
+    _BLOCK_COOLDOWN.pop(name, None)
+
 
 _STATE_LABEL = {
     "blocked": "блокировка антиботом",
@@ -377,6 +416,18 @@ _STATE_LABEL = {
 # Даже при неизменном состоянии раз в N часов напоминаем — чтобы «тихо сломано»
 # не превратилось в «тихо забыто». 0 = не напоминать вообще.
 _ALERT_REPEAT_SEC = int(os.getenv("ALERT_REPEAT_HOURS", "12")) * 3600
+
+# После скольких часов в нештатном состоянии напоминание получает «пора чинить
+# руками»-хвост. 0 = не эскалировать.
+_ESCALATE_SEC = int(os.getenv("ALERT_ESCALATE_HOURS", "24")) * 3600 or float("inf")
+
+
+def _fmt_duration(sec: float) -> str:
+    hours = int(sec // 3600)
+    if hours < 24:
+        return f"{hours} ч"
+    days, rem = divmod(hours, 24)
+    return f"{days} д {rem} ч" if rem else f"{days} д"
 
 
 async def _notify_state(resource: dict, state: str, msg: str = None):
@@ -392,18 +443,35 @@ async def _notify_state(resource: dict, state: str, msg: str = None):
 
     if state == "ok":
         if prev and prev[0] != "ok":
+            since = _STATE_SINCE.pop(name, None)
+            lasted = f", лежал {_fmt_duration(now - since)}" if since else ""
             await bot.send_notice(
                 f"✅ <b>{_html.escape(name)}</b> снова парсится "
-                f"(было: {_STATE_LABEL.get(prev[0], prev[0])})"
+                f"(было: {_STATE_LABEL.get(prev[0], prev[0])}{lasted})"
             )
+        _STATE_SINCE.pop(name, None)
         _RESOURCE_STATE[name] = ("ok", now)
         return
+
+    if not prev or prev[0] != state:
+        _STATE_SINCE[name] = now
 
     if prev and prev[0] == state:
         stale = _ALERT_REPEAT_SEC and (now - prev[1]) >= _ALERT_REPEAT_SEC
         if not stale:
             logger.info(f"{name}: состояние '{state}' не изменилось — алерт подавлен")
             return
+
+    # Повторное напоминание про давно мёртвый ресурс должно читаться не как
+    # фон, а как «пора что-то сделать»: без этого webdesignernews трое суток
+    # присылал одинаковые «всё ещё блокировка», и это выглядело нормой.
+    down = now - _STATE_SINCE.get(name, now)
+    if msg and down >= _ESCALATE_SEC:
+        msg += (
+            f"\n\n⏳ <b>Ресурс не парсится уже {_fmt_duration(down)}.</b> "
+            f"Пора либо дать ему прокси, либо поставить на паузу на /sites — "
+            f"иначе он так и будет тихо висеть мёртвым."
+        )
 
     if state == "blocked":
         await bot.send_notice(msg)
@@ -444,18 +512,43 @@ async def parse_resource(resource: dict, limit: int = None, blocked_keywords: li
             return [], problem
         logger.info(f"Спаршено {len(data)} статей с {resource['name']}")
         heartbeat.touch()
+        _block_cooldown_clear(resource.get("name", "unknown"))
         await _notify_state(resource, "ok")
         return data, None
     except BlockedByAntibot as e:
+        name = resource.get("name", "unknown")
         problem = f"{BLOCKED_PREFIX}: {e.reason}"
-        logger.warning(f"БЛОКИРОВКА {resource.get('name', 'unknown')}: {e.reason}")
-        await _notify_state(resource, "blocked", _blocked_msg(resource, e.reason))
+        pause_h = _block_cooldown_bump(name)
+        logger.warning(
+            f"БЛОКИРОВКА {name}: {e.reason} — пропускаем ресурс следующие {pause_h} ч"
+        )
+        await _notify_state(resource, "blocked", _blocked_msg(resource, e.reason, pause_h))
         return [], problem
     except Exception as e:
         problem = f"сайт недоступен: {e}"
         logger.error(f"ОШИБКА парсинга {resource.get('name', 'unknown')}: {problem}")
         await _notify_state(resource, "error", _admin_msg(resource, problem))
         return [], problem
+
+
+def _spread_by_domain(resources: list) -> list:
+    """Раскладывает ресурсы так, чтобы два подряд не били в один домен.
+
+    В конфиге по 2-3 ресурса на один хост (webkit.org ×3, medium.com ×3,
+    sitepoint ×2), и в исходном порядке они шли подряд — то есть три захода на
+    один домен за ~15 секунд, каждый час, ровно по расписанию. Для сайта за
+    Cloudflare это читается как бот даже при копеечном объёме запросов.
+    """
+    buckets: dict[str, list] = {}
+    for res in resources:
+        buckets.setdefault(storage.extract_domain(res.get("url", "")), []).append(res)
+    out = []
+    while buckets:
+        for domain in list(buckets):
+            out.append(buckets[domain].pop(0))
+            if not buckets[domain]:
+                del buckets[domain]
+    return out
 
 
 async def run_auto_parse():
@@ -479,10 +572,32 @@ async def run_auto_parse():
         else:
             global_known = set()
 
+        active = []
         for res in resources:
             if not res.get("active", False):
                 logger.info(f"{res['name']} на паузе — пропускаем")
                 continue
+            active.append(res)
+
+        skipped = 0
+        started_any = False
+        for res in _spread_by_domain(active):
+            left = _block_cooldown_left(res["name"])
+            if left > 0:
+                logger.info(
+                    f"{res['name']}: антибот-пауза, ещё {left / 60:.0f} мин — пропускаем"
+                )
+                skipped += 1
+                continue
+
+            # Пауза с джиттером между сайтами: ровный ритм «запрос раз в 5
+            # секунд» сам по себе выглядит как бот. Спим вне parse_lock, чтобы
+            # ручной парсинг из UI не ждал всю паузу.
+            if started_any and config.PARSE_DELAY_MAX_SEC > 0:
+                await asyncio.sleep(random.uniform(
+                    config.PARSE_DELAY_MIN_SEC, config.PARSE_DELAY_MAX_SEC
+                ))
+            started_any = True
 
             current = []
             err = None
@@ -519,6 +634,7 @@ async def run_auto_parse():
             f"Автопарсинг занял {elapsed:.2f}с | "
             f"всего новых: {len(all_new)} | ошибок: {len(errors)}"
             f" (из них блокировок: {blocked_n})"
+            f" | пропущено по антибот-паузе: {skipped}"
         )
         heartbeat.touch()
 

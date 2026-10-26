@@ -7,6 +7,7 @@ from flask import Blueprint, render_template, request
 from sqlalchemy import text
 
 import config
+import normalize
 import parser
 import storage
 from logging_setup import get_logger
@@ -86,7 +87,7 @@ def index():
 
         current = {
             "name": request.form["name"].strip(),
-            "url": request.form["url"].strip(),
+            "url": normalize.ensure_scheme(request.form["url"]),
             "item_selector": request.form["item_selector"].strip(),
             "title_selector": request.form["title_selector"].strip(),
             "link_selector": request.form["link_selector"].strip(),
@@ -192,7 +193,7 @@ async def parse_now():
         if not resource:
             resource = {
                 "name": request.form["name"].strip(),
-                "url": request.form["url"].strip(),
+                "url": normalize.ensure_scheme(request.form["url"]),
                 "item_selector": request.form["item_selector"].strip(),
                 "title_selector": request.form["title_selector"].strip(),
                 "link_selector": request.form["link_selector"].strip(),
