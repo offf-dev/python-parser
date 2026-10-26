@@ -8,6 +8,7 @@ import time
 import traceback
 import warnings
 
+import soupsieve as _sv
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
 
@@ -262,6 +263,26 @@ async def get_page_html_for_debug(url: str) -> str:
         return f"Ошибка: {e}"
 
 
+# soupsieve 3.x по умолчанию применяет «строгие правила CSS» и отвергает любой
+# сложный селектор внутри :has() — `td:has(a cite)` перестаёт компилироваться
+# вообще. Версия не закреплена в requirements, поэтому обычная пересборка
+# образа 26.10 молча сломала frontenddogma.com, который парсился накануне.
+# NOSTRICT возвращает поведение 2.x: селекторы в БД писались под него, и
+# переучивать их все на компаунд-форму — отдельная миграция, не побочный
+# эффект пересборки. getattr — на случай сборки со старым soupsieve.
+CSS_FLAGS = getattr(_sv, "NOSTRICT", 0)
+
+
+def css_select(node, selector: str):
+    """soup.select с флагами проекта. Через неё ходят и парсер, и /debug —
+    иначе /debug покажет «селектор рабочий» там, где парсер упадёт."""
+    return node.select(selector, flags=CSS_FLAGS)
+
+
+def css_select_one(node, selector: str):
+    return node.select_one(selector, flags=CSS_FLAGS)
+
+
 THIS_ARTICLE = "this_article"  # спец-значение для link_selector (docs/parser.md §3)
 
 
@@ -277,12 +298,12 @@ def extract_articles(html: str, item_selector: str, title_selector: str,
     limit = limit or config.PARSE_LIMIT
     blocked_keywords = blocked_keywords or []
     soup = BeautifulSoup(html, "lxml")
-    items = soup.select(item_selector)
+    items = css_select(soup, item_selector)
 
     out = []
     for item in items[:limit]:
         # Title
-        title_tag = item.select_one(title_selector)
+        title_tag = css_select_one(item, title_selector)
         title = title_tag.get_text(strip=True) if title_tag else ""
 
         # Link: спец-значение 'this_article' = сам элемент уже <a>
@@ -292,7 +313,7 @@ def extract_articles(html: str, item_selector: str, title_selector: str,
                 a = item.find("a", href=True)
                 link_raw = a["href"] if a else None
         else:
-            link_tag = item.select_one(link_selector)
+            link_tag = css_select_one(item, link_selector)
             if link_tag is not None:
                 # Fallback на data-href для сайтов вроде Medium, где URL живёт
                 # на <div data-href="..."> вместо <a href="...">.

@@ -83,7 +83,7 @@ def _signature(el) -> str:
 def _select(soup, selector: str):
     """soup.select с человеческой ошибкой вместо стектрейса."""
     try:
-        return soup.select(selector), None
+        return parser.css_select(soup, selector), None
     except Exception as e:
         return [], f"селектор не разобран: {e}"
 
@@ -129,7 +129,7 @@ def _analyze_title(items, selector: str) -> dict:
     found, empty, with_url, samples, texts = 0, 0, 0, [], []
     for el in items:
         try:
-            tag = el.select_one(selector)
+            tag = parser.css_select_one(el, selector)
         except Exception as e:
             return {"ok": False, "error": f"селектор не разобран: {e}"}
         if tag is None:
@@ -176,7 +176,7 @@ def _analyze_link(items, selector: str) -> dict:
                 raw = a["href"] if a else None
         else:
             try:
-                tag = el.select_one(selector)
+                tag = parser.css_select_one(el, selector)
             except Exception as e:
                 return {"ok": False, "error": f"селектор не разобран: {e}"}
             raw = (tag.get("href") or tag.get("data-href")) if tag is not None else None
@@ -307,7 +307,7 @@ def debug_check():
     if not out["blocks"].get("ok") or not title_sel:
         return jsonify(out)
 
-    items = soup.select(item_sel)
+    items = parser.css_select(soup, item_sel)
     out["title"] = _analyze_title(items, title_sel)
     if not out["title"].get("ok") or not link_sel:
         return jsonify(out)
